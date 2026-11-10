@@ -142,7 +142,7 @@ def ball_sprite(r, color, label="", pips=-1, max_pips=0):
     d = ImageDraw.Draw(im)
     if label:
         show_pips = max_pips > 0
-        fs = fit(label, 1.55 * R2, R2 * 0.8, min_size=10)
+        fs = fit(label, 1.7 * R2, R2 * 0.8, min_size=10)
         ty = c - (R2 * 0.14 if show_pips else 0)
         d.text((c, ty), label, font=font(fs), fill=(255, 255, 255), anchor="mm",
                stroke_width=max(2, fs // 9), stroke_fill=(0, 0, 0))

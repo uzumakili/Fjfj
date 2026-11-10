@@ -143,11 +143,11 @@ def _tune_k(counts, seed, target=20.0):
     return k
 
 
-def make(out, a, b, seed, cta="你押哪一邊？"):
-    """a、b：(名稱, 量詞, 數量)"""
+def make(out, a, b, seed, cta="Who wins? Comment below"):
+    """a、b：(單數名稱, 複數名稱, 數量)"""
     counts = (a[2], b[2])
-    names = (a[0], b[0])
-    units = (a[1], b[1])
+    names = tuple(s[1] if s[2] > 1 else s[0] for s in (a, b))
+    single = (a[0], b[0])
     sim = Sim(counts, seed, _tune_k(counts, seed))
     rng = random.Random(seed + 1)
     bg = core.background()
@@ -157,7 +157,7 @@ def make(out, a, b, seed, cta="你押哪一邊？"):
     audio = core.Audio()
     video = core.Video(out)
     parts = core.Particles(limit=500)
-    title = f"{a[2]}{a[1]}{a[0]} vs {b[2]}{b[1]}{b[0]}"
+    title = f"{a[2]} {names[0]} vs {b[2]} {names[1]}"
     tsize = core.fit(title, W - 90, 88)
     end_t = None
     win = None
@@ -196,7 +196,7 @@ def make(out, a, b, seed, cta="你押哪一邊？"):
                           fill=core.shade(COL[s], float(sim.tone[i])),
                           outline=(0, 0, 0))
         for i, x, y, r, s in big:
-            core.paste_sprite(img, core.ball_sprite(int(r), COL[s], names[s]), x, y)
+            core.paste_sprite(img, core.ball_sprite(int(r), COL[s], single[s]), x, y)
             f = max(0.0, float(sim.hp[i] / sim.hp0[i]))
             bw = r * 1.5
             d.rectangle([x - bw / 2, y - r - 22, x + bw / 2, y - r - 10],
@@ -219,8 +219,8 @@ def make(out, a, b, seed, cta="你押哪一邊？"):
             core.draw_text(d, (W / 2, 1548), cta, 50, fill=(140, 230, 255))
         else:
             core.banner(img, 980, [
-                (f"{names[win]} 獲勝", 120, COL[win]),
-                (f"還剩 {sim.count(win)} {units[win]}", 58, (255, 255, 255))])
+                (f"{names[win].upper()} {'WIN' if counts[win] > 1 else 'WINS'}!", 120, COL[win]),
+                (f"{sim.count(win)} left", 58, (255, 255, 255))])
         video.write(img)
         if end_t is not None and t >= end_t:
             break

@@ -244,7 +244,7 @@ def _plan(names, seed, target=25.0, n_max=N_MAX):
     return sec + 1
 
 
-def make(out, title, names, seed, cta="留言你押誰"):
+def make(out, title, names, seed, cta="Comment your pick"):
     n = _plan(names, seed)
     finish_y = START_Y + n * SEC_H
     sim = Sim(names, seed, n, finish_y)
@@ -347,14 +347,14 @@ def make(out, title, names, seed, cta="留言你押誰"):
         prog = min(1.0, max(0.0, (lead.y - BALL_Y0) / (finish_y - BALL_Y0)))
         d.rectangle([620, 372, 990, 396], fill=(40, 40, 60))
         d.rectangle([620, 372, 620 + 370 * prog, 396], fill=(255, 220, 90))
-        core.draw_text(d, (805, 440), f"進度 {int(prog * 100)}%", 40, stroke=3)
+        core.draw_text(d, (805, 440), f"Progress {int(prog * 100)}%", 40, stroke=3)
         if end_t is None:
             core.draw_text(d, (W / 2, 1548), cta, 50, fill=(140, 230, 255))
         else:
             top = sim.finished
-            lines = [("冠軍", 54, (255, 220, 90)), (top[0].name, 130, top[0].color)]
+            lines = [("WINNER", 54, (255, 220, 90)), (top[0].name, 130, top[0].color)]
             if len(top) > 1:
-                rest = "　".join(f"{k + 2}. {b.name}" for k, b in enumerate(top[1:3]))
+                rest = "   ".join(f"{k + 2}. {b.name}" for k, b in enumerate(top[1:3]))
                 lines.append((rest, 50, (255, 255, 255)))
             core.banner(img, 820, lines)
         video.write(img)

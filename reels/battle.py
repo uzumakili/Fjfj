@@ -127,7 +127,7 @@ def _tune_hp(names, seed, target=26.0):
     return best
 
 
-def make(out, title, names, seed, cta="留言你支持誰"):
+def make(out, title, names, seed, cta="Comment your pick"):
     hp = _tune_hp(names, seed)
     sim = Sim(names, seed, hp)
     fx_rng = random.Random(seed + 1)
@@ -183,20 +183,20 @@ def make(out, title, names, seed, cta="留言你支持誰"):
         parts.draw(d, ox, oy)
 
         core.draw_text(d, (W / 2, 275), title, tsize, stroke=6)
-        core.draw_text(d, (W / 2, 380), f"剩下 {len(sim.balls)}", 52,
+        core.draw_text(d, (W / 2, 380), f"{len(sim.balls)} left", 52,
                        fill=(255, 220, 90))
         y = 1452
         for ft, a, b in feed[-2:]:
             age = t - ft
             k = max(0.35, 1 - age / 6)
-            s = f"{a.name} 淘汰了 {b.name}"
+            s = f"{a.name} eliminated {b.name}"
             core.draw_text(d, (W / 2, y), s, core.fit(s, W - 120, 46),
                            fill=core.shade((255, 255, 255), k), stroke=3)
             y += 56
         if winner is None:
             core.draw_text(d, (W / 2, 1562), cta, 50, fill=(140, 230, 255))
         else:
-            core.banner(img, 1500, [("獲勝", 54, (255, 220, 90)),
+            core.banner(img, 1500, [("WINNER", 54, (255, 220, 90)),
                                     (winner.name, 130, winner.color)])
         video.write(img)
         if end_t is not None and t >= end_t:

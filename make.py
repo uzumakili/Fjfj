@@ -18,22 +18,25 @@ def load_themes():
 
 
 def parse_side(s):
-    """'雞:隻:1000' 或 '雞:1000'"""
+    """'chicken:1000'（複數自動加 s）或 'goose:geese:50'"""
     p = s.split(":")
-    if len(p) == 2:
-        return [p[0], "個", int(p[1])]
-    if len(p) == 3:
-        return [p[0], p[1], int(p[2])]
-    raise SystemExit(f"格式錯誤：{s}（要像 雞:隻:1000）")
+    try:
+        if len(p) == 2:
+            return [p[0], p[0] + "s", int(p[1])]
+        if len(p) == 3:
+            return [p[0], p[1], int(p[2])]
+    except ValueError:
+        pass
+    raise SystemExit(f"格式錯誤：{s}（要像 chicken:1000 或 goose:geese:50）")
 
 
 def pick_list(args, themes, rng):
-    """回傳 (主題名, 名詞, 項目清單)"""
+    """回傳 (主題名, 主題設定, 項目清單)"""
     if args.items:
         items = [x.strip() for x in args.items.replace("，", ",").split(",") if x.strip()]
         if len(items) < 2:
             raise SystemExit("--items 至少要兩個，用逗號分開")
-        return "自訂", args.noun or "", items[:MAX_ITEMS]
+        return "custom", {}, items[:MAX_ITEMS]
     name = args.theme or rng.choice(sorted(themes["lists"]))
     if name not in themes["lists"]:
         raise SystemExit(f"沒有「{name}」這個主題。可用：{'、'.join(themes['lists'])}")
@@ -41,7 +44,7 @@ def pick_list(args, themes, rng):
     items = list(th["items"])
     if len(items) > MAX_ITEMS:
         items = rng.sample(items, MAX_ITEMS)
-    return name, th["noun"], items
+    return name, th, items
 
 
 def run(mode, args, themes):
@@ -54,16 +57,16 @@ def run(mode, args, themes):
 
     print(f"[{mode}] seed={seed}")
     if mode == "battle":
-        name, noun, items = pick_list(args, themes, rng)
-        title = args.title or f"誰是最強{noun}？"
+        name, th, items = pick_list(args, themes, rng)
+        title = args.title or th.get("battle", "Who wins?")
         return battle.make(path(name), title, items, seed)
     if mode == "race":
-        name, noun, items = pick_list(args, themes, rng)
-        title = args.title or f"{noun}彈珠賽跑"
+        name, th, items = pick_list(args, themes, rng)
+        title = args.title or th.get("race", "Marble Race")
         return race.make(path(name), title, items, seed)
     if mode == "versus":
         if args.a and args.b:
-            a, b, name = parse_side(args.a), parse_side(args.b), "自訂"
+            a, b, name = parse_side(args.a), parse_side(args.b), "custom"
         else:
             name = args.theme or rng.choice(sorted(themes["versus"]))
             if name not in themes["versus"]:
@@ -74,10 +77,11 @@ def run(mode, args, themes):
             raise SystemExit("每一邊的數量要在 1 到 1500 之間")
         return versus.make(path(name), a, b, seed)
     if mode == "grow":
-        return grow.make_grow(path("變大"), seed, args.title or "球每彈一次就變大")
+        return grow.make_grow(path("ball"), seed,
+                              args.title or "The ball grows every bounce")
     if mode == "multiply":
-        return grow.make_multiply(path("變多"), seed,
-                                  args.title or "每撞一次牆就多一顆球")
+        return grow.make_multiply(path("balls"), seed,
+                                  args.title or "+1 ball every wall hit")
     raise SystemExit(f"未知模式：{mode}")
 
 
@@ -87,11 +91,10 @@ def main():
                     help="battle 大逃殺 / race 彈珠賽跑 / versus 對決 / grow 變大 / "
                          "multiply 變多 / random 隨機 / list 列出主題")
     ap.add_argument("--theme", help="主題名稱（見 list）")
-    ap.add_argument("--items", help="自訂項目，用逗號分開，例如 珍珠,椰果,布丁")
-    ap.add_argument("--noun", help="自訂項目的總稱，例如 珍奶配料")
+    ap.add_argument("--items", help="自訂項目，用逗號分開，例如 Pearl,Jelly,Pudding")
     ap.add_argument("--title", help="自訂影片標題")
-    ap.add_argument("--a", help="對決 A 方，例如 雞:隻:1000")
-    ap.add_argument("--b", help="對決 B 方，例如 大象:隻:1")
+    ap.add_argument("--a", help="對決 A 方，例如 chicken:1000")
+    ap.add_argument("--b", help="對決 B 方，例如 elephant:1")
     ap.add_argument("--seed", type=int, help="亂數種子；同一個種子會產生一模一樣的影片")
     ap.add_argument("-n", type=int, default=1, help="一次產生幾支")
     ap.add_argument("--out", default=os.path.join(HERE, "output"), help="輸出資料夾")
@@ -101,11 +104,11 @@ def main():
     if args.mode == "list":
         print("清單主題（battle / race 用）：")
         for k, v in themes["lists"].items():
-            print(f"  {k}：{'、'.join(v['items'])}")
+            print(f"  {k}：{', '.join(v['items'])}")
         print("對決主題（versus 用）：")
         for k, v in themes["versus"].items():
             a, b = v["a"], v["b"]
-            print(f"  {k}：{a[2]}{a[1]}{a[0]} vs {b[2]}{b[1]}{b[0]}")
+            print(f"  {k}：{a[2]} {a[1] if a[2] > 1 else a[0]} vs {b[2]} {b[1] if b[2] > 1 else b[0]}")
         return
     if args.n > 1 and args.seed is not None:
         raise SystemExit("-n 大於 1 時不要指定 --seed，不然每支都一樣")

@@ -80,7 +80,7 @@ def _tune_growth(seed, target=22.0):
     return best
 
 
-def make_grow(out, seed, title="球每彈一次就變大"):
+def make_grow(out, seed, title="The ball grows every bounce"):
     sim = GrowSim(seed, _tune_growth(seed))
     rng = random.Random(seed + 1)
     hue0 = rng.random()
@@ -133,13 +133,13 @@ def make_grow(out, seed, title="球每彈一次就變大"):
         d = ImageDraw.Draw(img)
         parts.draw(d)
         core.draw_text(d, (W / 2, 275), title, tsize, stroke=6)
-        core.draw_text(d, (W / 2, 380), f"彈了 {sim.bounces} 次", 56,
+        core.draw_text(d, (W / 2, 380), f"Bounces: {sim.bounces}", 56,
                        fill=(255, 220, 90))
         if sim.done:
-            core.banner(img, CY, [("塞滿了", 120, (255, 255, 255)),
-                                  (f"總共彈了 {sim.bounces} 次", 60, (255, 220, 90))])
+            core.banner(img, CY, [("FULL!", 120, (255, 255, 255)),
+                                  (f"{sim.bounces} bounces total", 60, (255, 220, 90))])
         else:
-            core.draw_text(d, (W / 2, 1520), "猜猜要彈幾次才會塞滿？", 50,
+            core.draw_text(d, (W / 2, 1520), "Guess how many bounces to fill it", 50,
                            fill=(140, 230, 255))
         video.write(img)
         if end_t is not None and t >= end_t:
@@ -210,7 +210,7 @@ def _tune_g(seed, cap, target=20.0):
     return best
 
 
-def make_multiply(out, seed, title="每撞一次牆就多一顆球", cap=2000):
+def make_multiply(out, seed, title="+1 ball every wall hit", cap=2000):
     sim = MultiSim(seed, cap, _tune_g(seed, cap))
     rng = random.Random(seed + 1)
     bg = core.background()
@@ -252,12 +252,12 @@ def make_multiply(out, seed, title="每撞一次牆就多一顆球", cap=2000):
                           outline=(0, 0, 0))
         parts.draw(d)
         core.draw_text(d, (W / 2, 275), title, tsize, stroke=6)
-        core.draw_text(d, (W / 2, 380), f"{sim.n} 顆", 60, fill=(255, 220, 90))
+        core.draw_text(d, (W / 2, 380), f"{sim.n} balls", 60, fill=(255, 220, 90))
         if end_t is not None:
-            core.banner(img, CY, [("滿了", 130, (255, 255, 255)),
-                                  (f"總共 {sim.n} 顆球", 60, (255, 220, 90))])
+            core.banner(img, CY, [("FULL!", 130, (255, 255, 255)),
+                                  (f"{sim.n} balls total", 60, (255, 220, 90))])
         else:
-            core.draw_text(d, (W / 2, 1520), "你撐到第幾顆才滑走？", 50,
+            core.draw_text(d, (W / 2, 1520), "How long can you watch?", 50,
                            fill=(140, 230, 255))
         video.write(img)
         if end_t is not None and t >= end_t:

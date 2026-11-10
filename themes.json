@@ -1,22 +1,22 @@
 {
   "lists": {
-    "珍奶配料": {"noun": "珍奶配料", "items": ["珍珠", "椰果", "布丁", "仙草", "芋圓", "粉條", "愛玉", "紅豆", "寒天", "奶蓋"]},
-    "台灣小吃": {"noun": "台灣小吃", "items": ["滷肉飯", "雞排", "臭豆腐", "蚵仔煎", "牛肉麵", "小籠包", "鹽酥雞", "肉圓", "刈包", "碗粿", "蔥油餅", "豆花"]},
-    "星座": {"noun": "星座", "items": ["牡羊", "金牛", "雙子", "巨蟹", "獅子", "處女", "天秤", "天蠍", "射手", "摩羯", "水瓶", "雙魚"]},
-    "縣市": {"noun": "縣市", "items": ["台北", "新北", "桃園", "台中", "台南", "高雄", "新竹", "基隆", "嘉義", "屏東", "宜蘭", "花蓮", "台東", "苗栗", "彰化", "南投", "雲林", "澎湖", "金門"]},
-    "早餐": {"noun": "早餐", "items": ["蛋餅", "飯糰", "蘿蔔糕", "鐵板麵", "漢堡", "吐司", "燒餅", "油條", "豆漿", "奶茶"]},
-    "火鍋料": {"noun": "火鍋料", "items": ["貢丸", "魚餃", "蛋餃", "豆皮", "金針菇", "高麗菜", "王子麵", "鴨血", "百頁豆腐", "玉米", "芋頭", "米血"]},
-    "科目": {"noun": "科目", "items": ["國文", "英文", "數學", "物理", "化學", "生物", "歷史", "地理", "公民", "體育"]},
-    "水果": {"noun": "水果", "items": ["芒果", "西瓜", "鳳梨", "芭樂", "荔枝", "香蕉", "蓮霧", "釋迦", "葡萄", "草莓", "榴槤", "木瓜"]},
-    "生肖": {"noun": "生肖", "items": ["鼠", "牛", "虎", "兔", "龍", "蛇", "馬", "羊", "猴", "雞", "狗", "豬"]}
+    "boba": {"battle": "Which boba topping wins?", "race": "Boba Topping Marble Race", "items": ["Pearl", "Jelly", "Pudding", "Taro", "Red Bean", "Aloe", "Lychee", "Mango", "Foam", "Oreo"]},
+    "zodiac": {"battle": "Which zodiac sign wins?", "race": "Zodiac Marble Race", "items": ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo", "Libra", "Scorpio", "Sag", "Capri", "Aqua", "Pisces"]},
+    "countries": {"battle": "Which country wins?", "race": "Country Marble Race", "items": ["USA", "UK", "Japan", "Korea", "Taiwan", "Brazil", "France", "Germany", "Italy", "Spain", "Mexico", "Canada", "India", "China", "Turkey", "Egypt", "Peru", "Chile", "Kenya", "Poland"]},
+    "fruits": {"battle": "Which fruit wins?", "race": "Fruit Marble Race", "items": ["Apple", "Banana", "Mango", "Grape", "Peach", "Lemon", "Cherry", "Kiwi", "Melon", "Orange", "Pear", "Plum"]},
+    "fastfood": {"battle": "Which fast food wins?", "race": "Fast Food Marble Race", "items": ["Burger", "Pizza", "Fries", "Taco", "Hot Dog", "Nuggets", "Sushi", "Ramen", "Kebab", "Donut"]},
+    "animals": {"battle": "Which animal wins?", "race": "Animal Marble Race", "items": ["Lion", "Tiger", "Bear", "Shark", "Wolf", "Eagle", "Gorilla", "Hippo", "Croc", "Rhino", "Moose", "Goose"]},
+    "months": {"battle": "Which birth month wins?", "race": "Birth Month Marble Race", "items": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]},
+    "subjects": {"battle": "Which school subject wins?", "race": "School Subject Marble Race", "items": ["Math", "English", "Physics", "Chem", "Bio", "History", "Art", "Music", "PE", "Lunch"]},
+    "colors": {"battle": "Which color wins?", "race": "Color Marble Race", "items": ["Red", "Blue", "Green", "Yellow", "Pink", "Purple", "Orange", "Cyan", "White", "Gold"]}
   },
   "versus": {
-    "雞大象": {"a": ["雞", "隻", 1000], "b": ["大象", "隻", 1]},
-    "國中生猩猩": {"a": ["國中生", "個", 100], "b": ["大猩猩", "隻", 1]},
-    "貓狗": {"a": ["貓", "隻", 300], "b": ["狗", "隻", 30]},
-    "鵝熊": {"a": ["鵝", "隻", 50], "b": ["熊", "隻", 3]},
-    "幼稚園相撲": {"a": ["幼稚園生", "個", 200], "b": ["相撲選手", "個", 1]},
-    "蚊子人": {"a": ["蚊子", "隻", 1000], "b": ["人", "個", 5]},
-    "紅藍": {"a": ["橘隊", "人", 500], "b": ["藍隊", "人", 500]}
+    "chickens": {"a": ["chicken", "chickens", 1000], "b": ["elephant", "elephants", 1]},
+    "gorilla": {"a": ["man", "men", 100], "b": ["gorilla", "gorillas", 1]},
+    "catsdogs": {"a": ["cat", "cats", 300], "b": ["dog", "dogs", 30]},
+    "geese": {"a": ["goose", "geese", 50], "b": ["bear", "bears", 3]},
+    "toddlers": {"a": ["toddler", "toddlers", 200], "b": ["sumo", "sumos", 1]},
+    "mosquitoes": {"a": ["mosquito", "mosquitoes", 1000], "b": ["human", "humans", 5]},
+    "teams": {"a": ["orange", "orange", 500], "b": ["blue", "blue", 500]}
   }
 }
