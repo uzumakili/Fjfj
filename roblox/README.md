@@ -1,44 +1,44 @@
-# Chaos Arena（Roblox 遊戲）
+# Lumen Garden（Roblox 遊戲）
 
-回合制的生存派對遊戲。玩家被傳送到一塊 10×10 的浮空平台上，每回合連續遇到 3 種隨機災難，
-撐到最後的人獲勝，拿金幣到大廳買東西。一個人也能玩。遊戲內文字是英文。
+在漂浮島上培育發光花朵的養成遊戲。每朵花的外型由基因決定，要靠雜交配出新品種、
+完成訂單、填滿圖鑑。可以一個人玩，進度會存檔，離線時花會繼續長。遊戲內文字是英文。
 
-## 五種災難
+## 玩法
 
-| 名稱 | 內容 |
-|---|---|
-| Falling Tiles | 地板變紅後一塊一塊掉下去 |
-| Meteor Shower | 隕石砸在紅圈上，把人炸飛，有時連地板一起砸掉 |
-| The Sweeper | 旋轉的橫桿要跳過去，越轉越快，還會突然反轉 |
-| Rising Lava | 地板變成金字塔，岩漿上升，只有最頂端安全 |
-| Boulders | 巨石沿著紅色警示道滾過來 |
+1. 畫面下方是種子，點一顆選起來，走到空的土堆按 **E** 種下。
+2. 花開了再按 **E** 收成，得到花瓣（貨幣）和種子。
+3. **旁邊有別的花開著時，收成拿到的是兩朵花的雜交種子**；旁邊沒有花就是自交。
+4. 上方的訂單要求特定的花（例如「發光的藍色星形花，7 片花瓣以上」），種出來後在花旁按 **F** 交付，獎勵很高，訂單會越來越難。
+5. 花瓣可以買升級：更多土堆、長得更快、突變率更高、種子袋更大、基因透鏡。
 
-其他內容：大廳有玻璃牆可以看別人比賽、排行榜（Wins / Coins）、
-商店（Speed Boost 150 金幣、Rainbow Trail 100 金幣）、自動存檔。
+## 深度在哪裡
+
+- **顏色要自己配**：商店只賣紅、黃、藍三種野生種子。綠、青、紫要把兩種顏色種在隔壁雜交出來。
+- **隱性基因**：發光（Glowing）、重瓣（Double）、巨大（Giant）都是隱性，兩個基因都帶才會表現。
+  看起來普通的花可能是帶因者，自交或和另一個帶因者雜交才會出現。
+- **花形**：圓瓣、橢圓、星形，星形要兩個尖瓣基因。
+- **基因透鏡**：買了以後種子會顯示隱藏基因（例如 `Glow Gg`），可以有計畫地配種。
+- **圖鑑**：6 種顏色 × 3 種花形 × 發光 × 重瓣 × 巨大，共 144 個品種，每發現一種有獎勵。
 
 ## 怎麼開啟
 
 1. 安裝 [Roblox Studio](https://create.roblox.com/) 並登入。
-2. 用 Roblox Studio 開啟這個資料夾裡的 `ChaosArena.rbxlx`。
-3. 按上方的 **Play**（或 F5）試玩。地圖是腳本在遊戲開始時自動蓋出來的，所以編輯畫面是空的，這是正常的。
+2. 用 Roblox Studio 開啟 `LumenGarden.rbxlx`。
+3. 按上方的 **Play**。島嶼和介面是遊戲開始時由腳本建立的，所以編輯畫面是空的。
 
-### 如果 `ChaosArena.rbxlx` 打不開
+如果檔案打不開：新增一個 Baseplate 專案，在 **ServerScriptService** 新增 **Script** 貼上
+`src/Garden.server.lua`，在 **StarterPlayer → StarterPlayerScripts** 新增 **LocalScript** 貼上
+`src/Garden.client.lua`，再按 Play。
 
-改用手動貼上，一樣可以玩：
+## 發佈
 
-1. 在 Roblox Studio 新增一個 **Baseplate** 專案。
-2. 在右邊 Explorer 的 **ServerScriptService** 按 `+` 新增 **Script**，把 `src/Main.server.lua` 的內容整個貼進去。
-3. 展開 **StarterPlayer**，在 **StarterPlayerScripts** 按 `+` 新增 **LocalScript**，把 `src/Hud.client.lua` 的內容整個貼進去。
-4. 按 **Play**。
+1. **File → Publish to Roblox**。
+2. 要讓存檔生效：**File → Game Settings → Security**，打開 **Enable Studio Access to API Services**。
+3. 在 [Creator Hub](https://create.roblox.com/dashboard/creations) 把遊戲設成 Public。
 
-## 發佈到 Roblox
-
-1. Studio 左上 **File → Publish to Roblox**，填名稱後發佈。
-2. 要讓金幣和勝場存檔生效：**File → Game Settings → Security**，打開 **Enable Studio Access to API Services**。
-3. 到 [Creator Hub](https://create.roblox.com/dashboard/creations) 把遊戲設成 **Public**，別人才進得來。
+每個伺服器最多 12 座花園，建議把遊戲的 **Max Players** 設成 12 以下。
 
 ## 想調整
 
-數值都在 `src/Main.server.lua` 最上面的 settings 區塊，例如平台大小 `GRID`、
-每回合幾種災難 `EVENTS_PER_ROUND`、金幣獎勵與商店價格。
-改完執行 `python build.py` 重新產生 `ChaosArena.rbxlx`（或直接在 Studio 裡改腳本）。
+數值在 `src/Garden.server.lua` 最上面的 settings 區塊（起始花瓣、土堆數、價格等），
+介面顏色在 `src/Garden.client.lua` 的 theme 區塊。改完執行 `python build.py` 重新產生檔案。

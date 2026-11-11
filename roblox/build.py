@@ -1,4 +1,4 @@
-"""把 src/ 裡的兩個腳本打包成 Roblox Studio 可以直接開啟的 ChaosArena.rbxlx。
+"""把 src/ 裡的兩個腳本打包成 Roblox Studio 可以直接開啟的 LumenGarden.rbxlx。
 改完腳本後執行：python build.py"""
 import os
 
@@ -27,13 +27,13 @@ def service(cls, ref, inner):
 
 xml = ('<roblox version="4">'
        + service("ServerScriptService", "RBX1",
-                 script("Script", "RBX2", "ChaosArena", read("Main.server.lua")))
+                 script("Script", "RBX2", "LumenGarden", read("Garden.server.lua")))
        + service("StarterPlayer", "RBX3",
                  service("StarterPlayerScripts", "RBX4",
-                         script("LocalScript", "RBX5", "ChaosHud", read("Hud.client.lua"))))
+                         script("LocalScript", "RBX5", "LumenGardenUI", read("Garden.client.lua"))))
        + '</roblox>\n')
 
-out = os.path.join(HERE, "ChaosArena.rbxlx")
+out = os.path.join(HERE, "LumenGarden.rbxlx")
 with open(out, "w", encoding="utf-8", newline="\n") as f:
     f.write(xml)
 print("已產生", out)
