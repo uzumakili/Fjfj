@@ -1,4 +1,4 @@
-"""把 src/ 裡的兩個腳本打包成 Roblox Studio 可以直接開啟的 LumenGarden.rbxlx。
+"""把 src/ 裡的兩個腳本打包成 Roblox Studio 可以直接開啟的 NeonCanvas.rbxlx。
 改完腳本後執行：python build.py"""
 import os
 
@@ -10,6 +10,8 @@ def read(name):
         src = f.read()
     if "]]>" in src:
         raise SystemExit(f"{name} 裡不能出現 ]]> 這串字")
+    if len(src) > 190000:
+        raise SystemExit(f"{name} 超過 Roblox 單一腳本的長度上限")
     return src
 
 
@@ -27,13 +29,13 @@ def service(cls, ref, inner):
 
 xml = ('<roblox version="4">'
        + service("ServerScriptService", "RBX1",
-                 script("Script", "RBX2", "LumenGarden", read("Garden.server.lua")))
+                 script("Script", "RBX2", "NeonCanvas", read("NeonCanvas.server.lua")))
        + service("StarterPlayer", "RBX3",
                  service("StarterPlayerScripts", "RBX4",
-                         script("LocalScript", "RBX5", "LumenGardenUI", read("Garden.client.lua"))))
+                         script("LocalScript", "RBX5", "NeonCanvasClient", read("NeonCanvas.client.lua"))))
        + '</roblox>\n')
 
-out = os.path.join(HERE, "LumenGarden.rbxlx")
+out = os.path.join(HERE, "NeonCanvas.rbxlx")
 with open(out, "w", encoding="utf-8", newline="\n") as f:
     f.write(xml)
 print("已產生", out)

@@ -1,0 +1,4866 @@
+<roblox version="4"><Item class="ServerScriptService" referent="RBX1"><Properties><string name="Name">ServerScriptService</string></Properties><Item class="Script" referent="RBX2"><Properties><string name="Name">NeonCanvas</string><ProtectedString name="Source"><![CDATA[-- NEON CANVAS: server script (goes in ServerScriptService).
+--
+-- A team paint-brawler. Two teams fight over a floor of glowing dots: every dot you step on or
+-- splash turns your colour. This script owns every rule: the dot grid, fighters, computer
+-- opponents, abilities, rounds, rewards and saving. The client script only draws and sends input.
+--
+-- Written in plain Lua 5.1 syntax on purpose, so the offline test harness in roblox/test can run
+-- it outside Roblox.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+---------------------------------------------------------------------------------------------------
+-- Settings
+---------------------------------------------------------------------------------------------------
+
+local S = 7.2                    -- distance between dot centres
+local RINGS = 12                 -- the grid is a hexagon this many dots from centre to edge
+local ARENA_R = RINGS * S
+local SQ3 = math.sqrt(3)
+local FLOOR_Y = 50               -- height of the walking surface
+local BODY_Y = FLOOR_Y + 3       -- height of a standing fighter's middle
+local BOT_REST = FLOOR_Y + 2
+local KILL_Y = FLOOR_Y - 40      -- falling below this is a knock-out
+local DECK_Y = FLOOR_Y + 18      -- the glass waiting deck above the arena
+local BODY_R = 2
+local TEAM_SIZE = 4              -- computer players fill each team up to this size
+local WALK = 18
+local RESPAWN = 4
+local MAX_HP = 120
+local TIME = { intermission = 16, countdown = 4, match = 150, results = 12, rush = 25 }
+local TEAM_COLOR = { Color3.fromRGB(255, 138, 44), Color3.fromRGB(62, 160, 255) }
+local NEUTRAL = Color3.fromRGB(235, 236, 250)
+local MODE_ORDER = { "Turf", "Beacons", "KO" }
+local GOAL = { Turf = 0, Beacons = 200, KO = 25 }
+local SLOTS = { "a1", "a2" }
+local BOT_NAMES = { "Mochi", "Pixel", "Nori", "Boba", "Tofu", "Kiwi", "Pesto", "Miso", "Dango", "Yuzu", "Soba", "Taro",
+	"Udon", "Sesame", "Matcha", "Peach" }
+
+-- Everything the client needs to draw menus and predict cooldowns. Sent as JSON.
+local CONFIG = {
+	spacing = S,
+	floorY = FLOOR_Y,
+	walk = WALK,
+	respawn = RESPAWN,
+	teamNames = { "EMBER", "TIDE" },
+	teamColors = { { 255, 138, 44 }, { 62, 160, 255 } },
+	xpBase = 80,
+	xpStep = 40,
+	levelCap = 40,
+	primaryOrder = { "bolt", "scatter", "lob" },
+	abilityOrder = { "nova", "shield", "mine", "vortex", "beam", "blink", "mend", "overdrive" },
+	titleOrder = { "rookie", "dotter", "splash", "bandit", "knight", "thief", "king", "prism" },
+	primaries = {
+		bolt = { name = "Bolt", cd = 0.4, unlock = 1, range = 60, desc = "Quick paint shot that lands where you aim." },
+		scatter = { name = "Scatter", cd = 0.75, unlock = 3, range = 34, desc = "Five-shot fan. Brutal up close." },
+		lob = { name = "Lob", cd = 1.05, unlock = 7, range = 55, desc = "Arcing shell that bursts on landing." },
+	},
+	abilities = {
+		nova = { name = "Nova", cd = 9, unlock = 1, range = 0, desc = "Blast and repaint everything around you." },
+		shield = { name = "Shield", cd = 12, unlock = 1, range = 0, desc = "Block all damage for 3 seconds." },
+		mine = { name = "Mine", cd = 7, unlock = 2, range = 0, desc = "Drop a trap that bursts under enemies." },
+		vortex = { name = "Vortex", cd = 13, unlock = 4, range = 42, desc = "Whirlpool that drags enemies in." },
+		beam = { name = "Beam", cd = 10, unlock = 6, range = 60, desc = "Charged ray that pierces a whole line." },
+		blink = { name = "Blink", cd = 8, unlock = 8, range = 34, desc = "Teleport and burst on arrival." },
+		mend = { name = "Mend", cd = 16, unlock = 10, range = 0, desc = "Totem that heals nearby allies." },
+		overdrive = { name = "Overdrive", cd = 14, unlock = 12, range = 0, desc = "Run faster and paint wider for 5 seconds." },
+	},
+	dash = { name = "Dash", cd = 3.5, desc = "Burst of speed. You cannot be hit mid-dash." },
+	ult = { name = "Chroma Burst", desc = "Charge it by painting and fighting, then repaint a huge area." },
+	titles = {
+		rookie = { name = "Rookie", cost = 0 },
+		dotter = { name = "Dotter", cost = 150 },
+		splash = { name = "Splash Artist", cost = 400 },
+		bandit = { name = "Brush Bandit", cost = 800 },
+		knight = { name = "Neon Knight", cost = 1500 },
+		thief = { name = "Colour Thief", cost = 2500 },
+		king = { name = "Canvas King", cost = 4000 },
+		prism = { name = "Prism Lord", cost = 7000 },
+	},
+	ranks = {
+		{ name = "Bronze", at = 0 }, { name = "Silver", at = 120 }, { name = "Gold", at = 300 },
+		{ name = "Platinum", at = 550 }, { name = "Diamond", at = 900 }, { name = "Prism", at = 1400 },
+	},
+	modes = {
+		Turf = { name = "TURF", goal = "Paint the most dots" },
+		Beacons = { name = "BEACONS", goal = "Hold the light beacons" },
+		KO = { name = "KO RUSH", goal = "Knock out the other team" },
+	},
+}
+
+---------------------------------------------------------------------------------------------------
+-- Shared plumbing
+---------------------------------------------------------------------------------------------------
+
+local World, Grid, Fighters, Combat, Shots, Abilities = {}, {}, {}, {}, {}, {}
+local Props, Power, Bots, Modes, Profiles, Match = {}, {}, {}, {}, {}, {}
+
+-- G is the state of the current round.
+local G = { state = "Boot", round = 0, mode = "Turf", endsAt = 0, rush = false, score = { 0, 0 }, goal = 0, secAcc = 0 }
+local live = {}   -- [player] = { character, root, hum, fill } for characters that are alive right now
+
+local rng = Random.new()
+
+local function now()
+	return workspace:GetServerTimeNow()
+end
+
+local function dist(x0, z0, x1, z1)
+	local dx, dz = x1 - x0, z1 - z0
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local shared = make("Folder", { Name = "NeonCanvas" }, nil)
+local function remote(name)
+	return make("RemoteEvent", { Name = name }, shared)
+end
+local actEvent = remote("Act")           -- client -> server: use an ability
+local requestEvent = remote("Request")   -- client -> server: menu choices
+local fxEvent = remote("FX")             -- server -> clients: things to draw
+local feedEvent = remote("Feed")         -- server -> clients: knock-outs and announcements
+local hurtEvent = remote("Hurt")         -- server -> one client: you were hit
+local resultsEvent = remote("Results")   -- server -> one client: end-of-match card
+make("StringValue", { Name = "Config", Value = HttpService:JSONEncode(CONFIG) }, shared)
+shared:SetAttribute("State", "Boot")
+shared:SetAttribute("EndsAt", 0)
+shared:SetAttribute("Mode", "Turf")
+shared:SetAttribute("MapName", "")
+shared:SetAttribute("ScoreA", 0)
+shared:SetAttribute("ScoreB", 0)
+shared:SetAttribute("Goal", 0)
+shared:SetAttribute("Total", 1)
+shared:SetAttribute("Rush", false)
+shared:SetAttribute("Round", 0)
+shared.Parent = ReplicatedStorage
+
+local function FX(...)
+	fxEvent:FireAllClients(...)
+end
+
+local errorCount = 0
+local function guard(label, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok and errorCount < 30 then
+		errorCount = errorCount + 1
+		warn("[NeonCanvas] " .. label .. ": " .. tostring(err))
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- World: lighting and the parts that never change
+---------------------------------------------------------------------------------------------------
+
+local UPRIGHT = CFrame.Angles(0, 0, math.rad(90))
+
+-- An upright cylinder. Roblox cylinders lie along X, so they are turned 90 degrees.
+local function cyl(parent, x, y, z, radius, height, color, material, extra)
+	local props = {
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(height, radius * 2, radius * 2),
+		CFrame = CFrame.new(x, y, z) * UPRIGHT,
+		Color = color,
+		Material = material or Enum.Material.SmoothPlastic,
+		Anchored = true,
+		CastShadow = false,
+		TopSurface = Enum.SurfaceType.Smooth,
+		BottomSurface = Enum.SurfaceType.Smooth,
+	}
+	if extra then
+		for k, v in pairs(extra) do
+			props[k] = v
+		end
+	end
+	return make("Part", props, parent)
+end
+
+local function spawnPad(parent, name)
+	return make("SpawnLocation", {
+		Name = name,
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Transparency = 1,
+		Neutral = true,
+		Duration = 0,
+		Size = Vector3.new(10, 1, 10),
+		Position = Vector3.new(0, DECK_Y + 0.5, 0),
+		TopSurface = Enum.SurfaceType.Smooth,
+	}, parent)
+end
+
+function World.build()
+	local old = workspace:FindFirstChild("Baseplate")
+	if old then
+		old:Destroy()
+	end
+	for _, obj in ipairs(workspace:GetChildren()) do
+		if obj:IsA("SpawnLocation") then
+			obj:Destroy()
+		end
+	end
+	for _, obj in ipairs(Lighting:GetChildren()) do
+		if obj:IsA("PostEffect") or obj:IsA("Atmosphere") then
+			obj:Destroy()
+		end
+	end
+
+	-- night, so the neon floor is the brightest thing on screen
+	Lighting.ClockTime = 0
+	Lighting.Brightness = 1.6
+	Lighting.Ambient = Color3.fromRGB(96, 96, 134)
+	Lighting.OutdoorAmbient = Color3.fromRGB(108, 108, 152)
+	Lighting.GlobalShadows = false
+	Lighting.EnvironmentDiffuseScale = 0.4
+	Lighting.EnvironmentSpecularScale = 0.3
+	make("Atmosphere", {
+		Density = 0.3,
+		Offset = 0.1,
+		Color = Color3.fromRGB(64, 70, 124),
+		Decay = Color3.fromRGB(28, 26, 60),
+		Glare = 0,
+		Haze = 1.2,
+	}, Lighting)
+	make("BloomEffect", { Intensity = 0.6, Size = 24, Threshold = 1 }, Lighting)
+	make("ColorCorrectionEffect", { Contrast = 0.1, Saturation = 0.18, TintColor = Color3.fromRGB(246, 242, 255) }, Lighting)
+
+	local root = make("Folder", { Name = "NeonCanvas" }, workspace)
+	for _, name in ipairs({ "Tiles", "Bases", "Pillars", "Bots", "Props", "Static" }) do
+		World[name] = make("Folder", { Name = name }, root)
+	end
+
+	-- the glass deck where everyone waits between matches
+	World.deck = cyl(World.Static, 0, DECK_Y - 0.6, 0, 22, 1.2, Color3.fromRGB(150, 170, 255), Enum.Material.Glass,
+		{ Name = "Deck", Transparency = 0.55 })
+	World.deckRim = cyl(World.Static, 0, DECK_Y - 1.5, 0, 22.8, 0.4, Color3.fromRGB(190, 170, 255), Enum.Material.Neon,
+		{ Name = "DeckRim", CanCollide = false, Transparency = 0.2 })
+	World.lobbyPad = spawnPad(World.Static, "LobbyPad")
+	World.pad = { spawnPad(World.Static, "PadEmber"), spawnPad(World.Static, "PadTide") }
+
+	-- a ring of light posts frames the canvas
+	for i = 1, 18 do
+		local a = i / 18 * math.pi * 2
+		cyl(World.Static, math.cos(a) * (ARENA_R + 16), FLOOR_Y + 4, math.sin(a) * (ARENA_R + 16), 0.5, 30,
+			Color3.fromRGB(190, 170, 255), Enum.Material.Neon, { Name = "Post", CanCollide = false, Transparency = 0.35 })
+	end
+	-- soft lights far below give the void some depth
+	for i = 1, 6 do
+		local a = i / 6 * math.pi * 2 + 0.4
+		local d = 60 + (i % 3) * 45
+		make("Part", {
+			Name = "Glow",
+			Shape = Enum.PartType.Ball,
+			Size = Vector3.new(90, 90, 90),
+			Position = Vector3.new(math.cos(a) * d, FLOOR_Y - 230 - (i % 2) * 60, math.sin(a) * d),
+			Color = Color3.fromHSV(0.62 + i * 0.045, 0.6, 0.4),
+			Material = Enum.Material.Neon,
+			Transparency = 0.8,
+			Anchored = true,
+			CanCollide = false,
+			CanQuery = false,
+			CastShadow = false,
+		}, World.Static)
+	end
+end
+
+function World.setDeck(visible)
+	World.deck.Transparency = visible and 0.55 or 1
+	World.deck.CanCollide = visible
+	World.deckRim.Transparency = visible and 0.2 or 1
+end
+
+---------------------------------------------------------------------------------------------------
+-- Grid: the dots. Axial hex coordinates (q, r) <-> world (x, z).
+---------------------------------------------------------------------------------------------------
+
+Grid.tiles = {}        -- every tile of the current map (floor and pillars)
+Grid.at = {}           -- [key] = tile
+Grid.floorCount = 0
+Grid.count = { 0, 0 }  -- dots owned by each team
+Grid.baseTile = {}
+Grid.beacons = {}
+
+local NEIGHBOURS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, -1 }, { -1, 1 } }
+
+local function tileKey(q, r)
+	return (q + 64) * 128 + (r + 64)
+end
+
+function Grid.toWorld(q, r)
+	return S * (q + r / 2), S * r * SQ3 / 2
+end
+
+function Grid.tileAt(x, z)
+	local fr = z / (S * SQ3 / 2)
+	local fq = x / S - fr / 2
+	local fy = -fq - fr
+	local q, r, y = math.floor(fq + 0.5), math.floor(fr + 0.5), math.floor(fy + 0.5)
+	local dq, dr, dy = math.abs(q - fq), math.abs(r - fr), math.abs(y - fy)
+	if dq > dr and dq > dy then
+		q = -r - y
+	elseif dr > dy then
+		r = -q - y
+	end
+	return Grid.at[tileKey(q, r)]
+end
+
+function Grid.floorAt(x, z)
+	local t = Grid.tileAt(x, z)
+	if t and t.kind == 1 then
+		return t
+	end
+	return nil
+end
+
+-- true when no pillar blocks the straight line
+function Grid.clear(x0, z0, x1, z1)
+	local dx, dz = x1 - x0, z1 - z0
+	local n = math.max(1, math.ceil(math.sqrt(dx * dx + dz * dz) / 3.2))
+	for i = 1, n - 1 do
+		local t = Grid.tileAt(x0 + dx * i / n, z0 + dz * i / n)
+		if t and t.kind == 2 then
+			return false
+		end
+	end
+	return true
+end
+
+-- true when every step of the straight line is floor
+function Grid.walkable(x0, z0, x1, z1)
+	local dx, dz = x1 - x0, z1 - z0
+	local n = math.max(1, math.ceil(math.sqrt(dx * dx + dz * dz) / 2.4))
+	for i = 1, n do
+		local t = Grid.tileAt(x0 + dx * i / n, z0 + dz * i / n)
+		if not t or t.kind ~= 1 then
+			return false
+		end
+	end
+	return true
+end
+
+local function near(x, z, px, pz, radius)
+	local dx, dz = x - px, z - pz
+	return dx * dx + dz * dz <= radius * radius
+end
+
+local function ringPoints(radius, angles)
+	local points = {}
+	for _, deg in ipairs(angles) do
+		table.insert(points, { math.cos(math.rad(deg)) * radius, math.sin(math.rad(deg)) * radius })
+	end
+	return points
+end
+
+-- Maps. Every layout is mirrored left-to-right so both teams get the same ground.
+local R = ARENA_R
+local MAPS = {
+	{
+		name = "Plaza",
+		off = Color3.fromRGB(48, 52, 86),
+		base = Color3.fromRGB(20, 22, 38),
+		pillars = ringPoints(0.42 * R, { 30, 90, 150, 210, 270, 330 }),
+		layout = function(x, z, ring)
+			return ring <= 11
+		end,
+	},
+	{
+		name = "Donut",
+		off = Color3.fromRGB(58, 46, 84),
+		base = Color3.fromRGB(26, 18, 40),
+		pillars = ringPoints(0.66 * R, { 45, 135, 225, 315 }),
+		layout = function(x, z, ring)
+			return ring <= 12 and not near(x, z, 0, 0, 3.3 * S)
+		end,
+	},
+	{
+		name = "Twin Isles",
+		off = Color3.fromRGB(40, 60, 84),
+		base = Color3.fromRGB(16, 26, 38),
+		pillars = { { 0.5 * R, 0.2 * R }, { 0.5 * R, -0.2 * R }, { -0.5 * R, 0.2 * R }, { -0.5 * R, -0.2 * R } },
+		layout = function(x, z)
+			local ax, az = math.abs(x), math.abs(z)
+			if near(ax, z, 0.5 * R, 0, 0.47 * R) then
+				return true
+			end
+			return ax <= 0.2 * R and (az <= 1.6 * S or math.abs(az - 0.36 * R) <= 1.1 * S)
+		end,
+	},
+	{
+		name = "Clover",
+		off = Color3.fromRGB(44, 66, 70),
+		base = Color3.fromRGB(16, 30, 32),
+		pillars = { { 0.26 * R, 0.26 * R }, { 0.26 * R, -0.26 * R }, { -0.26 * R, 0.26 * R }, { -0.26 * R, -0.26 * R } },
+		layout = function(x, z)
+			local ax, az = math.abs(x), math.abs(z)
+			return near(ax, z, 0.48 * R, 0, 0.36 * R) or near(x, az, 0, 0.48 * R, 0.36 * R) or near(x, z, 0, 0, 0.2 * R)
+		end,
+	},
+	{
+		name = "Lattice",
+		off = Color3.fromRGB(62, 52, 70),
+		base = Color3.fromRGB(28, 22, 32),
+		pillars = {},
+		layout = function(x, z, ring, q, r)
+			return ring <= 12 and not (q % 4 == 0 and r % 4 == 0)
+		end,
+	},
+}
+
+local function nearestFloor(list, x, z)
+	local best, bestD = nil, math.huge
+	for _, t in ipairs(list) do
+		if t.kind == 1 then
+			local d = dist(t.x, t.z, x, z)
+			if d < bestD then
+				best, bestD = t, d
+			end
+		end
+	end
+	return best
+end
+
+local function linkNeighbours(list)
+	for _, t in ipairs(list) do
+		t.nb = {}
+		for _, d in ipairs(NEIGHBOURS) do
+			local n = Grid.at[tileKey(t.q + d[1], t.r + d[2])]
+			if n then
+				table.insert(t.nb, n)
+			end
+		end
+	end
+end
+
+-- Works out which dots exist for a map. Returns false if the map came out broken.
+function Grid.plan(def)
+	Grid.at = {}
+	local list = {}
+	for q = -RINGS, RINGS do
+		for r = -RINGS, RINGS do
+			local ring = math.max(math.abs(q), math.abs(r), math.abs(q + r))
+			if ring <= RINGS then
+				local x, z = Grid.toWorld(q, r)
+				if def.layout(x, z, ring, q, r) then
+					local kind = 1
+					for _, p in ipairs(def.pillars) do
+						if near(x, z, p[1], p[2], S * 0.55) then
+							kind = 2
+						end
+					end
+					local t = { q = q, r = r, x = x, z = z, kind = kind, owner = 0, nb = {} }
+					Grid.at[tileKey(q, r)] = t
+					table.insert(list, t)
+				end
+			end
+		end
+	end
+	linkNeighbours(list)
+	local baseA = nearestFloor(list, -0.84 * R, 0)
+	local baseB = nearestFloor(list, 0.84 * R, 0)
+	if not baseA or not baseB then
+		return false
+	end
+	-- keep only the floor that can be walked to from the first base
+	local reached = { [baseA] = true }
+	local queue, head = { baseA }, 1
+	while head <= #queue do
+		local t = queue[head]
+		head = head + 1
+		for _, n in ipairs(t.nb) do
+			if n.kind == 1 and not reached[n] then
+				reached[n] = true
+				table.insert(queue, n)
+			end
+		end
+	end
+	if not reached[baseB] then
+		return false
+	end
+	local kept = {}
+	Grid.at = {}
+	for _, t in ipairs(list) do
+		local keep = reached[t]
+		if t.kind == 2 then
+			for _, n in ipairs(t.nb) do
+				if reached[n] then
+					keep = true
+				end
+			end
+		end
+		if keep then
+			Grid.at[tileKey(t.q, t.r)] = t
+			table.insert(kept, t)
+		end
+	end
+	linkNeighbours(kept)
+	Grid.tiles = kept
+	Grid.baseTile = { baseA, baseB }
+	Grid.floorCount = 0
+	for i, t in ipairs(kept) do
+		t.idx = i
+		if t.kind == 1 then
+			Grid.floorCount = Grid.floorCount + 1
+		end
+	end
+	return Grid.floorCount >= 40
+end
+
+function Grid.build(def)
+	World.Tiles:ClearAllChildren()
+	World.Bases:ClearAllChildren()
+	World.Pillars:ClearAllChildren()
+	World.Props:ClearAllChildren()
+	if not Grid.plan(def) then
+		warn("[NeonCanvas] map " .. def.name .. " is broken, using Plaza instead")
+		def = MAPS[1]
+		Grid.plan(def)
+	end
+	Grid.map = def
+	Grid.count = { 0, 0 }
+	Grid.beacons = {}
+	World.Tiles:SetAttribute("Off", def.off)
+	for _, t in ipairs(Grid.tiles) do
+		if t.kind == 1 then
+			cyl(World.Bases, t.x, FLOOR_Y - 1.5, t.z, 4.2, 3, def.base)
+			local dot = cyl(nil, t.x, FLOOR_Y - 0.05, t.z, 3.3, 0.6, def.off, nil, { Name = "Dot" })
+			dot:SetAttribute("T", 0)
+			dot.Parent = World.Tiles
+			t.dot = dot
+		else
+			cyl(World.Pillars, t.x, FLOOR_Y + 4, t.z, 3.7, 14, Color3.fromRGB(206, 210, 236))
+			cyl(World.Pillars, t.x, FLOOR_Y + 11.2, t.z, 3.9, 0.4, Color3.fromRGB(255, 255, 255), Enum.Material.Neon,
+				{ CanCollide = false })
+		end
+	end
+	for team = 1, 2 do
+		local base = Grid.baseTile[team]
+		World.pad[team].Position = Vector3.new(base.x, FLOOR_Y + 1, base.z)
+	end
+	shared:SetAttribute("MapName", def.name)
+	shared:SetAttribute("Total", Grid.floorCount)
+end
+
+function Grid.spawnPoint(team, n)
+	local base = Grid.baseTile[team]
+	local spots = { base }
+	for _, nb in ipairs(base.nb) do
+		if nb.kind == 1 then
+			table.insert(spots, nb)
+		end
+	end
+	local t = spots[n % #spots + 1]
+	return t.x, t.z
+end
+
+function Grid.setOwner(t, team, f)
+	if t.kind ~= 1 or t.owner == team then
+		return false
+	end
+	if t.owner ~= 0 then
+		Grid.count[t.owner] = Grid.count[t.owner] - 1
+	end
+	t.owner = team
+	Grid.count[team] = Grid.count[team] + 1
+	t.dot:SetAttribute("T", team)
+	if f then
+		f.stats.tiles = f.stats.tiles + 1
+		Combat.addUlt(f, 0.2)
+	end
+	return true
+end
+
+function Grid.paintCircle(team, x, z, radius, f)
+	local r2 = radius * radius
+	for _, t in ipairs(Grid.tiles) do
+		if t.kind == 1 and t.owner ~= team then
+			local dx, dz = t.x - x, t.z - z
+			if dx * dx + dz * dz <= r2 then
+				Grid.setOwner(t, team, f)
+			end
+		end
+	end
+end
+
+-- Paints along a line. With radius 0 only the dots directly under the line change.
+function Grid.paintLine(team, x0, z0, x1, z1, radius, f)
+	local dx, dz = x1 - x0, z1 - z0
+	local steps = math.max(1, math.ceil(math.sqrt(dx * dx + dz * dz) / 3))
+	for i = 0, steps do
+		local x, z = x0 + dx * i / steps, z0 + dz * i / steps
+		if radius > 0 then
+			Grid.paintCircle(team, x, z, radius, f)
+		else
+			local t = Grid.floorAt(x, z)
+			if t then
+				Grid.setOwner(t, team, f)
+			end
+		end
+	end
+end
+
+-- Three beacons on the centre line, the same distance from both bases.
+function Grid.placeBeacons()
+	local onAxis = {}
+	for _, t in ipairs(Grid.tiles) do
+		if t.kind == 1 and math.abs(t.x) < S * 0.3 then
+			table.insert(onAxis, t)
+		end
+	end
+	local used = {}
+	for _, targetZ in ipairs({ 0, -0.5 * R, 0.5 * R }) do
+		local best, bestScore = nil, math.huge
+		for _, t in ipairs(onAxis) do
+			local blocked = used[t]
+			for _, n in ipairs(t.nb) do
+				if used[n] then
+					blocked = true
+				end
+			end
+			if not blocked then
+				local floors = 0
+				for _, n in ipairs(t.nb) do
+					if n.kind == 1 then
+						floors = floors + 1
+					end
+				end
+				local score = math.abs(t.z - targetZ) + (6 - floors) * 6
+				if score < bestScore then
+					best, bestScore = t, score
+				end
+			end
+		end
+		if best then
+			local cluster = { best }
+			used[best] = true
+			for _, n in ipairs(best.nb) do
+				if n.kind == 1 then
+					table.insert(cluster, n)
+					used[n] = true
+				end
+			end
+			local beacon = { tile = best, cluster = cluster, owner = 0 }
+			beacon.pole = cyl(World.Props, best.x, FLOOR_Y + 20, best.z, 0.7, 40, NEUTRAL, Enum.Material.Neon,
+				{ Name = "Beacon", CanCollide = false, Transparency = 0.35 })
+			for _, t in ipairs(cluster) do
+				t.beacon = beacon
+				t.dot:SetAttribute("B", true)
+			end
+			table.insert(Grid.beacons, beacon)
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Fighters: human players and computer players share one shape
+---------------------------------------------------------------------------------------------------
+
+Fighters.list = {}
+Fighters.byPlayer = {}
+Fighters.nextId = 1
+
+function Fighters.new(team, player, botName)
+	local f = {
+		id = Fighters.nextId,
+		team = team,
+		player = player,
+		isBot = player == nil,
+		name = player and player.DisplayName or botName,
+		alive = false,
+		loadout = { primary = "bolt", a1 = "nova", a2 = "shield" },
+		ready = { primary = 0, dash = 0, a1 = 0, a2 = 0 },
+		ult = 0,
+		shieldUntil = 0,
+		invulnUntil = 0,
+		hasteUntil = 0,
+		surgeUntil = 0,
+		overdriveUntil = 0,
+		dashPaintUntil = 0,
+		dashUntil = 0,
+		lastHitAt = -100,
+		respawnAt = 0,
+		nextThink = 0,
+		faceX = team == 1 and 1 or -1,
+		faceZ = 0,
+		velX = 0,
+		velZ = 0,
+		kvx = 0,
+		kvz = 0,
+		vy = 0,
+		hp = MAX_HP,
+		skill = 0.5,
+		stats = { tiles = 0, kos = 0, deaths = 0, damage = 0, streak = 0 },
+		mines = {},
+	}
+	Fighters.nextId = Fighters.nextId + 1
+	table.insert(Fighters.list, f)
+	if player then
+		Fighters.byPlayer[player] = f
+		player:SetAttribute("Team", team)
+		player:SetAttribute("FID", f.id)
+		player:SetAttribute("Ult", 0)
+	end
+	return f
+end
+
+function Fighters.remove(f)
+	for i, v in ipairs(Fighters.list) do
+		if v == f then
+			table.remove(Fighters.list, i)
+			break
+		end
+	end
+	if f.player and Fighters.byPlayer[f.player] == f then
+		Fighters.byPlayer[f.player] = nil
+	end
+	f.alive = false
+	if f.part then
+		f.part:Destroy()
+		f.part = nil
+	end
+	for i = #Props.list, 1, -1 do
+		local p = Props.list[i]
+		if p and p.owner == f then
+			Props.remove(p)
+		end
+	end
+end
+
+-- Returns x, y, z of a living fighter, or nil.
+function Fighters.pos(f)
+	if not f.alive then
+		return nil
+	end
+	if f.isBot then
+		return f.x, f.y, f.z
+	end
+	local root = f.root
+	if root and root.Parent then
+		local p = root.Position
+		return p.X, p.Y, p.Z
+	end
+	return nil
+end
+
+-- Name tag with a health bar. Returns the gui and the bar's fill frame.
+function Fighters.plate(parent, name, color, sub, offset)
+	local gui = make("BillboardGui", {
+		Name = "Plate",
+		Size = UDim2.new(0, 130, 0, 44),
+		StudsOffset = Vector3.new(0, offset, 0),
+		AlwaysOnTop = true,
+		MaxDistance = 320,
+		LightInfluence = 0,
+	}, nil)
+	make("TextLabel", {
+		Name = "Title",
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 12),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 10,
+		TextColor3 = Color3.fromRGB(200, 204, 230),
+		TextStrokeTransparency = 0.5,
+		Text = sub or "",
+	}, gui)
+	make("TextLabel", {
+		Name = "Name",
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 0, 0, 12),
+		Size = UDim2.new(1, 0, 0, 18),
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextColor3 = color,
+		TextStrokeTransparency = 0.3,
+		Text = name,
+	}, gui)
+	local back = make("Frame", {
+		Name = "Bar",
+		Position = UDim2.new(0.5, -34, 0, 33),
+		Size = UDim2.new(0, 68, 0, 6),
+		BackgroundColor3 = Color3.fromRGB(14, 16, 28),
+		BorderSizePixel = 0,
+	}, gui)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, back)
+	local fill = make("Frame", {
+		Name = "Fill",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+	}, back)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+	gui.Parent = parent
+	return gui, fill
+end
+
+local function setFill(fill, fraction)
+	if fill and fill.Parent then
+		fill.Size = UDim2.new(math.clamp(fraction, 0, 1), 0, 1, 0)
+	end
+end
+
+-- Name tag and team outline for a player's character.
+function Fighters.decorate(info, player, team)
+	local character = info.character
+	local glow = character:FindFirstChild("TeamGlow")
+	if glow then
+		glow:Destroy()
+	end
+	local head = character:FindFirstChild("Head") or info.root
+	if info.plate then
+		info.plate:Destroy()
+	end
+	local color = team > 0 and TEAM_COLOR[team] or NEUTRAL
+	local profile = Profiles.data[player]
+	local title = ""
+	if profile and profile.title ~= "rookie" then
+		title = CONFIG.titles[profile.title].name
+	end
+	info.plate, info.fill = Fighters.plate(head, player.DisplayName, color, title, 2.6)
+	setFill(info.fill, info.hum.Health / math.max(1, info.hum.MaxHealth))
+	if team > 0 then
+		make("Highlight", {
+			Name = "TeamGlow",
+			FillColor = color,
+			FillTransparency = 0.78,
+			OutlineColor = color,
+			OutlineTransparency = 0.05,
+			DepthMode = Enum.HighlightDepthMode.Occluded,
+		}, character)
+	end
+end
+
+-- Puts a player where they belong right now: their base during a match, the deck otherwise.
+function Fighters.place(player)
+	local info = live[player]
+	if not info or info.hum.Health <= 0 or not info.root.Parent then
+		return
+	end
+	local f = Fighters.byPlayer[player]
+	local inMatch = f ~= nil and (G.state == "Countdown" or G.state == "Playing")
+	local x, y, z
+	if f and (inMatch or G.state == "Results") then
+		x, z = Grid.spawnPoint(f.team, f.id)
+		y = FLOOR_Y + 4
+	else
+		local a = rng:NextNumber(0, math.pi * 2)
+		local d = rng:NextNumber(2, 12)
+		x, y, z = math.cos(a) * d, DECK_Y + 4, math.sin(a) * d
+	end
+	info.character:PivotTo(CFrame.new(Vector3.new(x, y, z), Vector3.new(0, y, 0.01)))
+	info.root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	if inMatch then
+		f.character, f.root, f.hum = info.character, info.root, info.hum
+		f.alive = true
+		f.lastX, f.lastZ = nil, nil
+		f.velX, f.velZ = 0, 0
+		Fighters.decorate(info, player, f.team)
+		if G.state == "Playing" then
+			Combat.protect(f, 2.5)
+			Grid.paintCircle(f.team, x, z, 8.5, nil)
+			info.hum.WalkSpeed = WALK
+		else
+			info.hum.WalkSpeed = 0
+		end
+	else
+		Fighters.decorate(info, player, f and f.team or 0)
+		info.hum.WalkSpeed = WALK
+	end
+end
+
+-- Called for every new character. Waits until Roblox has finished spawning it.
+function Fighters.bindCharacter(player, character)
+	local hum = character:WaitForChild("Humanoid", 15)
+	local root = character:WaitForChild("HumanoidRootPart", 15)
+	if not hum or not root then
+		return
+	end
+	character:WaitForChild("Head", 5)
+	local waited = 0
+	while character.Parent ~= workspace and waited < 15 do
+		waited = waited + task.wait()
+	end
+	task.wait(0.1)
+	if player.Character ~= character or hum.Health <= 0 or not player.Parent then
+		return
+	end
+	local regen = character:FindFirstChild("Health")
+	if regen and regen:IsA("BaseScript") then
+		regen:Destroy()
+	end
+	character.ChildAdded:Connect(function(child)
+		if child.Name == "Health" and child:IsA("BaseScript") then
+			task.defer(function()
+				child:Destroy()
+			end)
+		end
+	end)
+	hum.MaxHealth = MAX_HP
+	hum.Health = MAX_HP
+	hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	local info = { character = character, root = root, hum = hum }
+	live[player] = info
+	hum.HealthChanged:Connect(function(health)
+		setFill(info.fill, health / math.max(1, hum.MaxHealth))
+	end)
+	hum.Died:Connect(function()
+		if live[player] == info then
+			live[player] = nil
+		end
+		local f = Fighters.byPlayer[player]
+		if f and f.character == character then
+			Combat.down(f)
+		end
+	end)
+	Fighters.place(player)
+end
+
+function Fighters.spawnBot(f)
+	local x, z = Grid.spawnPoint(f.team, f.id)
+	f.x, f.y, f.z = x, BOT_REST, z
+	f.kvx, f.kvz, f.vy = 0, 0, 0
+	f.velX, f.velZ = 0, 0
+	f.hp = MAX_HP
+	f.alive = true
+	f.wayX, f.wayZ = nil, nil
+	f.lastX, f.lastZ = nil, nil
+	f.dashUntil = 0
+	if not f.part then
+		local color = TEAM_COLOR[f.team]
+		local part = make("Part", {
+			Name = "Bot",
+			Shape = Enum.PartType.Ball,
+			Size = Vector3.new(3.6, 3.6, 3.6),
+			Anchored = true,
+			CanCollide = false,
+			CanQuery = false,
+			CanTouch = false,
+			CastShadow = false,
+			Material = Enum.Material.Neon,
+			Color = color,
+			TopSurface = Enum.SurfaceType.Smooth,
+			BottomSurface = Enum.SurfaceType.Smooth,
+		}, nil)
+		part:SetAttribute("Team", f.team)
+		part:SetAttribute("FID", f.id)
+		part:SetAttribute("BotName", f.name)
+		f.plate, f.fill = Fighters.plate(part, f.name, color, "BOT", 3)
+		f.part = part
+		part.CFrame = CFrame.new(f.x, f.y, f.z)
+		part.Parent = World.Bots
+	end
+	f.part.CFrame = CFrame.new(f.x, f.y, f.z)
+	f.part.Transparency = 0
+	f.part:SetAttribute("Alive", true)
+	f.plate.Enabled = true
+	setFill(f.fill, 1)
+	if G.state == "Playing" then
+		Combat.protect(f, 2)
+		Grid.paintCircle(f.team, x, z, 8.5, nil)
+	end
+end
+
+-- Shows a timed effect on a fighter (shield bubble, speed, ...). The client draws it.
+function Fighters.mark(f, name, untilTime)
+	if f.isBot then
+		if f.part then
+			f.part:SetAttribute(name, untilTime)
+		end
+	elseif f.player then
+		f.player:SetAttribute(name, untilTime)
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Combat: damage, healing, knock-outs
+---------------------------------------------------------------------------------------------------
+
+function Combat.addUlt(f, amount)
+	if f.ult < 100 and not f.ultLock then
+		f.ult = math.min(100, f.ult + amount)
+	end
+end
+
+function Combat.protect(f, seconds)
+	local t = now()
+	f.invulnUntil = math.max(f.invulnUntil, t + seconds)
+	if f.isBot then
+		Fighters.mark(f, "SafeT", t + seconds)
+	elseif f.character then
+		local field = make("ForceField", { Visible = true }, f.character)
+		task.delay(seconds, function()
+			field:Destroy()
+		end)
+	end
+end
+
+function Combat.surge(f)
+	if f and f.surgeUntil > now() then
+		return 1.35
+	end
+	return 1
+end
+
+function Combat.heal(f, amount)
+	if not f.alive then
+		return
+	end
+	if f.isBot then
+		local before = math.floor(f.hp)
+		f.hp = math.min(MAX_HP, f.hp + amount)
+		if math.floor(f.hp) ~= before then
+			setFill(f.fill, f.hp / MAX_HP)
+		end
+	else
+		local hum = f.hum
+		if hum and hum.Health > 0 and hum.Health < hum.MaxHealth then
+			hum.Health = math.min(hum.MaxHealth, hum.Health + amount)
+		end
+	end
+end
+
+-- kx, kz: sideways push. kup: upward push. Returns true if the hit landed.
+function Combat.damage(victim, amount, attacker, kx, kz, kup)
+	if not victim.alive or G.state ~= "Playing" then
+		return false
+	end
+	local t = now()
+	local x, y, z = Fighters.pos(victim)
+	if not x or victim.invulnUntil > t then
+		return false
+	end
+	if victim.shieldUntil > t then
+		FX("block", x, z)
+		return false
+	end
+	amount = math.floor(amount + 0.5)
+	victim.lastHitAt = t
+	if attacker and attacker ~= victim then
+		victim.lastHitBy = attacker
+		attacker.stats.damage = attacker.stats.damage + amount
+		Combat.addUlt(attacker, amount * 0.2)
+	end
+	FX("hit", x, y, z, amount, attacker and attacker.id or 0, victim.id)
+	if victim.isBot then
+		victim.hp = victim.hp - amount
+		victim.kvx = victim.kvx + kx
+		victim.kvz = victim.kvz + kz
+		if kup > 0 then
+			victim.vy = math.max(victim.vy, kup * 0.6)
+		end
+		setFill(victim.fill, victim.hp / MAX_HP)
+		if victim.hp <= 0 then
+			Combat.down(victim)
+		end
+	else
+		local hum = victim.hum
+		hum:TakeDamage(amount)
+		if victim.player then
+			hurtEvent:FireClient(victim.player, kx, kup, kz, amount)
+		end
+		if hum.Health <= 0 then
+			Combat.down(victim)
+		end
+	end
+	return true
+end
+
+-- A fighter is knocked out. Safe to call twice.
+function Combat.down(f)
+	if not f.alive then
+		return
+	end
+	local x, _, z = Fighters.pos(f)
+	local t = now()
+	f.alive = false
+	f.stats.deaths = f.stats.deaths + 1
+	f.stats.streak = 0
+	f.respawnAt = t + RESPAWN
+	f.dashUntil = 0
+	local killer = f.lastHitBy
+	if killer and (t - f.lastHitAt > 8 or killer.team == f.team) then
+		killer = nil
+	end
+	f.lastHitBy = nil
+	local counted = G.state == "Playing"
+	if killer then
+		killer.stats.kos = killer.stats.kos + 1
+		killer.stats.streak = killer.stats.streak + 1
+		Combat.addUlt(killer, 10)
+		if x then
+			FX("burst", x, z, 17, killer.team, "ko")
+			if counted then
+				Grid.paintCircle(killer.team, x, z, 17, killer)
+			end
+		end
+		feedEvent:FireAllClients("ko", killer.name, killer.team, f.name, f.team, killer.id, f.id)
+		if killer.stats.streak >= 3 then
+			feedEvent:FireAllClients("streak", killer.name, killer.team, killer.stats.streak)
+		end
+		if counted then
+			Modes.onKO(killer.team)
+		end
+	else
+		if x then
+			FX("burst", x, z, 8, f.team, "fall")
+		end
+		feedEvent:FireAllClients("fell", f.name, f.team, f.id)
+		if counted then
+			Modes.onKO(3 - f.team)
+		end
+	end
+	if f.isBot then
+		if f.part then
+			f.part.Transparency = 1
+			f.part:SetAttribute("Alive", false)
+			f.plate.Enabled = false
+		end
+	else
+		local hum = f.hum
+		if hum and hum.Health > 0 then
+			hum.Health = 0
+		end
+	end
+end
+
+-- Hurts enemies of `team` in a circle and paints it.
+function Combat.explode(owner, team, x, z, radius, dmg, kb, paintRadius, kind)
+	FX("burst", x, z, radius, team, kind)
+	if dmg > 0 then
+		for _, v in ipairs(Fighters.list) do
+			if v.alive and v.team ~= team then
+				local vx, vy, vz = Fighters.pos(v)
+				if vx and math.abs(vy - BODY_Y) < 14 then
+					local dx, dz = vx - x, vz - z
+					local d = math.sqrt(dx * dx + dz * dz)
+					if d <= radius + BODY_R then
+						if d < 0.05 then
+							local a = rng:NextNumber(0, math.pi * 2)
+							dx, dz, d = math.cos(a), math.sin(a), 1
+						end
+						Combat.damage(v, dmg, owner, dx / d * kb, dz / d * kb, kb * 0.55)
+					end
+				end
+			end
+		end
+	end
+	if paintRadius > 0 and G.state == "Playing" then
+		Grid.paintCircle(team, x, z, paintRadius * Combat.surge(owner), owner)
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Shots: paint bolts flying across the floor
+---------------------------------------------------------------------------------------------------
+
+Shots.list = {}
+Shots.nextId = 1
+
+function Shots.fire(owner, x, z, dx, dz, speed, range, dmg, kb, splash, kind)
+	local id = Shots.nextId
+	Shots.nextId = id + 1
+	table.insert(Shots.list, {
+		id = id, owner = owner, team = owner.team, x = x, z = z, dx = dx, dz = dz,
+		speed = speed, left = range, dmg = dmg, kb = kb, splash = splash,
+	})
+	FX("bolt", id, x, z, dx, dz, speed, range, owner.team, kind)
+end
+
+function Shots.step(dt)
+	local list = Shots.list
+	local i = 1
+	while i <= #list do
+		local s = list[i]
+		local step = math.min(s.left, s.speed * dt)
+		local nx, nz = s.x + s.dx * step, s.z + s.dz * step
+		local surge = Combat.surge(s.owner)
+		-- the first enemy touched along this step
+		local hit, hitT = nil, 2
+		for _, v in ipairs(Fighters.list) do
+			if v.alive and v.team ~= s.team then
+				local vx, vy, vz = Fighters.pos(v)
+				if vx and math.abs(vy - BODY_Y) < 5.5 then
+					local along = 0
+					if step > 0 then
+						along = math.clamp(((vx - s.x) * s.dx + (vz - s.z) * s.dz) / step, 0, 1)
+					end
+					local cx, cz = s.x + s.dx * step * along, s.z + s.dz * step * along
+					if near(vx, vz, cx, cz, BODY_R + 1.3) and along < hitT then
+						hit, hitT = v, along
+					end
+				end
+			end
+		end
+		local done, how = false, 0
+		if hit then
+			nx, nz = s.x + s.dx * step * hitT, s.z + s.dz * step * hitT
+			Combat.damage(hit, s.dmg, s.owner, s.dx * s.kb, s.dz * s.kb, s.kb * 0.35)
+			Grid.paintCircle(s.team, nx, nz, s.splash * 0.75 * surge, s.owner)
+			done, how = true, 1
+		else
+			local tile = Grid.tileAt(nx, nz)
+			if tile and tile.kind == 2 then
+				nx, nz = s.x, s.z
+				Grid.paintCircle(s.team, nx, nz, s.splash * 0.6, s.owner)
+				done, how = true, 2
+			elseif s.left - step <= 0.001 then
+				Grid.paintCircle(s.team, nx, nz, s.splash * surge, s.owner)
+				done, how = true, 0
+			end
+		end
+		if done then
+			FX("boltEnd", s.id, nx, nz, how, s.team, s.splash)
+			list[i] = list[#list]
+			list[#list] = nil
+		else
+			s.x, s.z, s.left = nx, nz, s.left - step
+			i = i + 1
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Props: mines, whirlpools and healing totems that sit on the floor for a while
+---------------------------------------------------------------------------------------------------
+
+Props.list = {}
+
+function Props.add(p)
+	local color = TEAM_COLOR[p.team]
+	if p.kind == "mine" then
+		p.part = cyl(World.Props, p.x, FLOOR_Y + 0.5, p.z, 1.5, 0.4, color, Enum.Material.Neon,
+			{ Name = "Mine", CanCollide = false })
+	elseif p.kind == "vortex" then
+		p.part = cyl(World.Props, p.x, FLOOR_Y + 0.45, p.z, 16, 0.2, color, Enum.Material.Neon,
+			{ Name = "Vortex", CanCollide = false, Transparency = 0.8 })
+	else
+		p.part = cyl(World.Props, p.x, FLOOR_Y + 3.2, p.z, 0.8, 6, color, Enum.Material.Neon,
+			{ Name = "Totem", CanCollide = false })
+	end
+	p.part:SetAttribute("Team", p.team)
+	table.insert(Props.list, p)
+	return p
+end
+
+function Props.remove(p)
+	for i, v in ipairs(Props.list) do
+		if v == p then
+			table.remove(Props.list, i)
+			break
+		end
+	end
+	if p.owner then
+		for i, v in ipairs(p.owner.mines) do
+			if v == p then
+				table.remove(p.owner.mines, i)
+				break
+			end
+		end
+	end
+	if p.part then
+		p.part:Destroy()
+		p.part = nil
+	end
+end
+
+-- Calls fn(fighter, distance, x, z) for living fighters within radius. enemies=true picks the other team.
+local function eachNear(team, enemies, x, z, radius, fn)
+	for _, v in ipairs(Fighters.list) do
+		if v.alive and (v.team ~= team) == enemies then
+			local vx, vy, vz = Fighters.pos(v)
+			if vx and math.abs(vy - BODY_Y) < 10 then
+				local d = dist(x, z, vx, vz)
+				if d <= radius then
+					fn(v, d, vx, vz)
+				end
+			end
+		end
+	end
+end
+
+function Props.step(t)
+	for i = #Props.list, 1, -1 do
+		local p = Props.list[i]
+		if p.kind == "mine" then
+			if t >= p.dieAt then
+				Props.remove(p)
+			elseif t >= p.armAt then
+				local tripped = false
+				eachNear(p.team, true, p.x, p.z, 6.5, function()
+					tripped = true
+				end)
+				if tripped then
+					Props.remove(p)
+					Combat.explode(p.owner, p.team, p.x, p.z, 12, 36, 44, 12, "mine")
+				end
+			end
+		elseif p.kind == "vortex" then
+			if t >= p.dieAt then
+				Props.remove(p)
+				Combat.explode(p.owner, p.team, p.x, p.z, 11, 0, 0, 11, "vortexEnd")
+			elseif t >= p.nextPulse then
+				p.nextPulse = t + 0.25
+				eachNear(p.team, true, p.x, p.z, 16, function(v, d, vx, vz)
+					if d > 1.5 then
+						Combat.damage(v, 5, p.owner, (p.x - vx) / d * 30, (p.z - vz) / d * 30, 10)
+					else
+						Combat.damage(v, 5, p.owner, 0, 0, 0)
+					end
+				end)
+			end
+		else
+			if t >= p.dieAt then
+				Props.remove(p)
+			elseif t >= p.nextPulse then
+				p.nextPulse = t + 0.5
+				eachNear(p.team, false, p.x, p.z, 14, function(v, _, vx, vz)
+					Combat.heal(v, 7)
+					FX("heal", vx, vz)
+				end)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Power-ups that appear on the floor
+---------------------------------------------------------------------------------------------------
+
+Power.list = {}
+Power.nextAt = 0
+local POWER_ORDER = { "surge", "haste", "mend", "charge" }
+local POWER_COLOR = {
+	surge = Color3.fromRGB(255, 110, 200),
+	haste = Color3.fromRGB(255, 226, 90),
+	mend = Color3.fromRGB(110, 240, 150),
+	charge = Color3.fromRGB(184, 132, 255),
+}
+
+function Power.spawn()
+	local baseA, baseB = Grid.baseTile[1], Grid.baseTile[2]
+	for _ = 1, 20 do
+		local t = Grid.tiles[rng:NextInteger(1, #Grid.tiles)]
+		if t.kind == 1 and dist(t.x, t.z, baseA.x, baseA.z) > 26 and dist(t.x, t.z, baseB.x, baseB.z) > 26 then
+			local taken = false
+			for _, p in ipairs(Power.list) do
+				if p.tile == t then
+					taken = true
+				end
+			end
+			if not taken then
+				local kind = POWER_ORDER[rng:NextInteger(1, #POWER_ORDER)]
+				local part = make("Part", {
+					Name = "Power",
+					Shape = Enum.PartType.Ball,
+					Size = Vector3.new(2.8, 2.8, 2.8),
+					Position = Vector3.new(t.x, FLOOR_Y + 3.2, t.z),
+					Color = POWER_COLOR[kind],
+					Material = Enum.Material.Neon,
+					Anchored = true,
+					CanCollide = false,
+					CanQuery = false,
+					CanTouch = false,
+					CastShadow = false,
+				}, nil)
+				part:SetAttribute("Kind", kind)
+				make("PointLight", { Color = POWER_COLOR[kind], Range = 14, Brightness = 2 }, part)
+				local gui = make("BillboardGui", {
+					Size = UDim2.new(0, 90, 0, 18),
+					StudsOffset = Vector3.new(0, 2.6, 0),
+					AlwaysOnTop = true,
+					MaxDistance = 220,
+					LightInfluence = 0,
+				}, part)
+				make("TextLabel", {
+					BackgroundTransparency = 1,
+					Size = UDim2.new(1, 0, 1, 0),
+					Font = Enum.Font.GothamBold,
+					TextSize = 12,
+					TextColor3 = POWER_COLOR[kind],
+					TextStrokeTransparency = 0.3,
+					Text = string.upper(kind),
+				}, gui)
+				part.Parent = World.Props
+				table.insert(Power.list, { tile = t, x = t.x, z = t.z, kind = kind, part = part })
+				return
+			end
+		end
+	end
+end
+
+function Power.step(t)
+	if t >= Power.nextAt then
+		Power.nextAt = t + 13
+		if #Power.list < 3 then
+			Power.spawn()
+		end
+	end
+	for i = #Power.list, 1, -1 do
+		local p = Power.list[i]
+		local taker = nil
+		eachNear(0, true, p.x, p.z, 4.4, function(v)
+			taker = taker or v
+		end)
+		if taker then
+			table.remove(Power.list, i)
+			p.part:Destroy()
+			if p.kind == "surge" then
+				taker.surgeUntil = t + 9
+				Fighters.mark(taker, "SurgeT", t + 9)
+			elseif p.kind == "haste" then
+				taker.hasteUntil = t + 9
+				Fighters.mark(taker, "HasteT", t + 9)
+			elseif p.kind == "mend" then
+				Combat.heal(taker, 45)
+			else
+				Combat.addUlt(taker, 35)
+			end
+			FX("burst", p.x, p.z, 6, taker.team, "pickup")
+			feedEvent:FireAllClients("pickup", taker.name, taker.team, p.kind)
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Abilities
+---------------------------------------------------------------------------------------------------
+
+-- Runs fn after a delay, but only if the same match is still being played.
+function Match.later(delay, fn)
+	local round = G.round
+	task.delay(delay, function()
+		if G.round == round and G.state == "Playing" then
+			guard("delayed effect", fn)
+		end
+	end)
+end
+
+Abilities.primary = {
+	bolt = function(f, x, z, dx, dz, d)
+		Shots.fire(f, x + dx * 2.2, z + dz * 2.2, dx, dz, 125, math.clamp(d, 10, 60) - 2.2, 20, 16, 7.6, "bolt")
+	end,
+	scatter = function(f, x, z, dx, dz)
+		for i = -2, 2 do
+			local a = math.rad(i * 9)
+			local c, s = math.cos(a), math.sin(a)
+			local rx, rz = dx * c - dz * s, dx * s + dz * c
+			Shots.fire(f, x + rx * 2.2, z + rz * 2.2, rx, rz, 105, 32, 8, 9, 5.4, "pellet")
+		end
+	end,
+	lob = function(f, x, z, dx, dz, d)
+		local range = math.clamp(d, 10, 55)
+		local tx, tz = x + dx * range, z + dz * range
+		local flight = 0.5 + range / 110
+		FX("lob", x, z, tx, tz, flight, f.team)
+		Match.later(flight, function()
+			Combat.explode(f, f.team, tx, tz, 11, 24, 30, 11, "lob")
+		end)
+	end,
+}
+
+-- Each returns false if it could not be used (the cooldown is then not spent).
+Abilities.use = {
+	nova = function(f, x, z)
+		Combat.explode(f, f.team, x, z, 15, 28, 58, 15, "nova")
+	end,
+	shield = function(f)
+		local t = now()
+		f.shieldUntil = t + 3
+		Fighters.mark(f, "ShieldT", t + 3)
+	end,
+	mine = function(f, x, z)
+		local tile = Grid.floorAt(x, z)
+		if not tile then
+			return false
+		end
+		if #f.mines >= 2 then
+			Props.remove(f.mines[1])
+		end
+		local t = now()
+		table.insert(f.mines, Props.add({
+			kind = "mine", owner = f, team = f.team, x = tile.x, z = tile.z, armAt = t + 0.9, dieAt = t + 45,
+		}))
+	end,
+	vortex = function(f, x, z, dx, dz, d)
+		local range = math.clamp(d, 4, 42)
+		local t = now()
+		Props.add({
+			kind = "vortex", owner = f, team = f.team, x = x + dx * range, z = z + dz * range,
+			dieAt = t + 2.6, nextPulse = t,
+		})
+	end,
+	beam = function(f, _, _, dx, dz)
+		FX("charge", f.id, 0.45, f.team)
+		Match.later(0.45, function()
+			local px, _, pz = Fighters.pos(f)
+			if not px then
+				return
+			end
+			local length = 60
+			for step = 3, 60, 3 do
+				local tile = Grid.tileAt(px + dx * step, pz + dz * step)
+				if tile and tile.kind == 2 then
+					length = step - 2
+					break
+				end
+			end
+			local ex, ez = px + dx * length, pz + dz * length
+			FX("beam", px, pz, ex, ez, f.team)
+			for _, v in ipairs(Fighters.list) do
+				if v.alive and v.team ~= f.team then
+					local vx, vy, vz = Fighters.pos(v)
+					if vx and math.abs(vy - BODY_Y) < 8 then
+						local along = math.clamp((vx - px) * dx + (vz - pz) * dz, 0, length)
+						if near(vx, vz, px + dx * along, pz + dz * along, 3.4 + BODY_R) then
+							Combat.damage(v, 36, f, dx * 34, dz * 34, 16)
+						end
+					end
+				end
+			end
+			Grid.paintLine(f.team, px, pz, ex, ez, 4.4, f)
+		end)
+	end,
+	blink = function(f, x, z, dx, dz, d)
+		local range = math.clamp(d, 8, 34)
+		local tx, tz = nil, nil
+		for back = range, 4, -3 do
+			if Grid.floorAt(x + dx * back, z + dz * back) then
+				tx, tz = x + dx * back, z + dz * back
+				break
+			end
+		end
+		if not tx then
+			return false
+		end
+		FX("burst", x, z, 5, f.team, "blink")
+		if f.isBot then
+			f.x, f.z = tx, tz
+			f.wayX, f.wayZ = nil, nil
+			f.nextThink = 0
+		else
+			local rotation = f.root.CFrame - f.root.Position
+			f.character:PivotTo(CFrame.new(tx, FLOOR_Y + 3.2, tz) * rotation)
+		end
+		f.lastX, f.lastZ = tx, tz
+		f.invulnUntil = math.max(f.invulnUntil, now() + 0.25)
+		Combat.explode(f, f.team, tx, tz, 9, 14, 24, 9, "blink")
+	end,
+	mend = function(f, x, z)
+		local t = now()
+		Props.add({ kind = "totem", owner = f, team = f.team, x = x, z = z, dieAt = t + 5, nextPulse = t })
+	end,
+	overdrive = function(f, x, z)
+		local t = now()
+		f.overdriveUntil = t + 5
+		Fighters.mark(f, "OverT", t + 5)
+		FX("burst", x, z, 6, f.team, "overdrive")
+	end,
+}
+
+-- The one entry point for every action, used by players and computer players alike.
+function Abilities.act(f, action, ax, az)
+	if G.state ~= "Playing" or not f.alive then
+		return false
+	end
+	local x, _, z = Fighters.pos(f)
+	if not x then
+		return false
+	end
+	local t = now()
+	local dx, dz = ax - x, az - z
+	local d = math.sqrt(dx * dx + dz * dz)
+	if d < 0.5 then
+		dx, dz, d = f.faceX, f.faceZ, 0.5
+	else
+		dx, dz = dx / d, dz / d
+	end
+	if action == "primary" then
+		if t < f.ready.primary - 0.12 then
+			return false
+		end
+		f.ready.primary = t + CONFIG.primaries[f.loadout.primary].cd
+		Abilities.primary[f.loadout.primary](f, x, z, dx, dz, d)
+	elseif action == "dash" then
+		if t < f.ready.dash - 0.12 then
+			return false
+		end
+		f.ready.dash = t + CONFIG.dash.cd
+		f.invulnUntil = math.max(f.invulnUntil, t + 0.28)
+		f.dashPaintUntil = t + 0.45
+		if f.isBot then
+			f.dashUntil = t + 0.17
+			f.dashX, f.dashZ = dx, dz
+		end
+		FX("dash", x, z, dx, dz, f.team, f.id)
+	elseif action == "a1" or action == "a2" then
+		if t < f.ready[action] - 0.12 then
+			return false
+		end
+		local id = f.loadout[action]
+		if Abilities.use[id](f, x, z, dx, dz, d) == false then
+			return false
+		end
+		f.ready[action] = t + CONFIG.abilities[id].cd
+	elseif action == "ult" then
+		if f.ult < 100 then
+			return false
+		end
+		f.ult = 0
+		FX("telegraph", x, z, 30, f.team, 0.7)
+		feedEvent:FireAllClients("ult", f.name, f.team)
+		Match.later(0.7, function()
+			f.ultLock = true
+			Combat.explode(f, f.team, x, z, 30, 50, 72, 30, "ult")
+			f.ultLock = false
+		end)
+	else
+		return false
+	end
+	f.faceX, f.faceZ = dx, dz
+	return true
+end
+
+actEvent.OnServerEvent:Connect(function(player, action, ax, az)
+	local f = Fighters.byPlayer[player]
+	if not f or type(action) ~= "string" or type(ax) ~= "number" or type(az) ~= "number" then
+		return
+	end
+	if ax ~= ax or az ~= az or math.abs(ax) > 5000 or math.abs(az) > 5000 then
+		return
+	end
+	guard("action", Abilities.act, f, action, ax, az)
+end)
+
+---------------------------------------------------------------------------------------------------
+-- Bots: computer players. They are simple points moved by this script, not Roblox characters,
+-- so they can never get stuck on geometry. The client draws a body for each one.
+---------------------------------------------------------------------------------------------------
+
+Bots.stamp = 0
+
+-- Breadth-first search over floor dots from where the bot stands. Returns the first step and the goal.
+function Bots.route(f, accept)
+	local start = Grid.floorAt(f.x, f.z)
+	if not start then
+		return nil
+	end
+	local stamp = Bots.stamp + 1
+	Bots.stamp = stamp
+	start.seen = stamp
+	start.from = nil
+	local queue, head = { start }, 1
+	while head <= #queue do
+		local t = queue[head]
+		head = head + 1
+		if t ~= start and accept(t) then
+			local step = t
+			while step.from and step.from ~= start do
+				step = step.from
+			end
+			return step, t
+		end
+		local nb = t.nb
+		local count = #nb
+		local offset = rng:NextInteger(0, 5)
+		for i = 1, count do
+			local n = nb[(i + offset) % count + 1]
+			if n.kind == 1 and n.seen ~= stamp then
+				n.seen = stamp
+				n.from = t
+				queue[#queue + 1] = n
+			end
+		end
+	end
+	return nil
+end
+
+-- Where to shoot to hit a moving target, with a miss that shrinks as skill grows.
+function Bots.aim(f, v)
+	local vx, _, vz = Fighters.pos(v)
+	local err = 2 + (1 - f.skill) * 11
+	return vx + v.velX * 0.25 + rng:NextNumber(-err, err), vz + v.velZ * 0.25 + rng:NextNumber(-err, err)
+end
+
+function Bots.paintTarget(f, range)
+	for _ = 1, 12 do
+		local t = Grid.tiles[rng:NextInteger(1, #Grid.tiles)]
+		if t.kind == 1 and t.owner ~= f.team then
+			local d = dist(f.x, f.z, t.x, t.z)
+			if d > 14 and d < range then
+				return t
+			end
+		end
+	end
+	return nil
+end
+
+function Bots.fight(f, t, enemy, ed)
+	local x, z = f.x, f.z
+	local lo = f.loadout
+	if f.ult >= 100 then
+		f.ultHold = f.ultHold or t
+		if (enemy and ed < 22) or t - f.ultHold > 7 then
+			f.ultHold = nil
+			Abilities.act(f, "ult", x, z)
+			return
+		end
+	end
+	if enemy then
+		local ex, _, ez = Fighters.pos(enemy)
+		local ax, az = Bots.aim(f, enemy)
+		for _, slot in ipairs(SLOTS) do
+			if t >= f.ready[slot] and rng:NextNumber() < 0.5 then
+				local id = lo[slot]
+				local use = false
+				if id == "nova" then
+					use = ed < 13
+				elseif id == "shield" then
+					use = t - f.lastHitAt < 0.6 and f.hp < MAX_HP * 0.75
+				elseif id == "mine" then
+					use = ed < 28
+				elseif id == "vortex" then
+					use = ed < 38
+				elseif id == "beam" then
+					use = ed < 52
+				elseif id == "blink" then
+					use = f.hp < MAX_HP * 0.45 and ed < 25
+				elseif id == "mend" then
+					use = f.hp < MAX_HP * 0.6
+				elseif id == "overdrive" then
+					use = ed > 30
+				end
+				if use then
+					if id == "blink" then
+						Abilities.act(f, slot, x + (x - ex) * 3, z + (z - ez) * 3)
+					else
+						Abilities.act(f, slot, ax, az)
+					end
+				end
+			end
+		end
+		if ed <= CONFIG.primaries[lo.primary].range and t >= f.ready.primary and rng:NextNumber() < 0.2 + f.skill * 0.4 then
+			Abilities.act(f, "primary", ax, az)
+		end
+		if t >= f.ready.dash and ((f.hp < MAX_HP * 0.4 and rng:NextNumber() < 0.3) or rng:NextNumber() < 0.06 * f.skill) then
+			local d = math.max(1, ed)
+			local sx, sz = -(ez - z) / d, (ex - x) / d
+			if rng:NextNumber() < 0.5 then
+				sx, sz = -sx, -sz
+			end
+			if Grid.walkable(x, z, x + sx * 17, z + sz * 17) then
+				Abilities.act(f, "dash", x + sx * 10, z + sz * 10)
+			end
+		end
+	else
+		if t >= f.ready.primary and rng:NextNumber() < 0.22 then
+			local target = Bots.paintTarget(f, CONFIG.primaries[lo.primary].range)
+			if target then
+				Abilities.act(f, "primary", target.x, target.z)
+			end
+		end
+		for _, slot in ipairs(SLOTS) do
+			if t >= f.ready[slot] then
+				local id = lo[slot]
+				if (id == "overdrive" and rng:NextNumber() < 0.25) or (id == "mend" and f.hp < MAX_HP * 0.6)
+					or (id == "mine" and rng:NextNumber() < 0.04) then
+					Abilities.act(f, slot, x, z)
+				end
+			end
+		end
+	end
+end
+
+function Bots.think(f, t)
+	f.nextThink = t + 0.22 + rng:NextNumber() * 0.2
+	local x, z = f.x, f.z
+	local enemy, ed = nil, 58
+	for _, v in ipairs(Fighters.list) do
+		if v.alive and v.team ~= f.team then
+			local vx, _, vz = Fighters.pos(v)
+			if vx then
+				local d = dist(x, z, vx, vz)
+				if d < ed and Grid.clear(x, z, vx, vz) then
+					enemy, ed = v, d
+				end
+			end
+		end
+	end
+
+	local step, goal = nil, nil
+	if f.hp < MAX_HP * 0.35 and enemy and ed < 30 and f.skill > 0.5 then
+		local base = Grid.baseTile[f.team]
+		step, goal = Bots.route(f, function(tile)
+			return tile == base
+		end)
+	end
+	if not step then
+		for _, p in ipairs(Power.list) do
+			if dist(x, z, p.x, p.z) < 34 then
+				step, goal = Bots.route(f, function(tile)
+					return tile == p.tile
+				end)
+				break
+			end
+		end
+	end
+	if not step and G.mode == "KO" and enemy and ed > 22 then
+		local ex, _, ez = Fighters.pos(enemy)
+		local target = Grid.floorAt(ex, ez)
+		if target then
+			step, goal = Bots.route(f, function(tile)
+				return tile == target
+			end)
+		end
+	end
+	if not step and G.mode == "Beacons" then
+		step, goal = Bots.route(f, function(tile)
+			return tile.beacon ~= nil and tile.owner ~= f.team
+		end)
+	end
+	if not step then
+		step, goal = Bots.route(f, function(tile)
+			return tile.owner ~= f.team
+		end)
+	end
+	if not step then
+		local here = Grid.floorAt(x, z)
+		if here then
+			local options = {}
+			for _, n in ipairs(here.nb) do
+				if n.kind == 1 then
+					table.insert(options, n)
+				end
+			end
+			if #options > 0 then
+				step = options[rng:NextInteger(1, #options)]
+				goal = step
+			end
+		end
+	end
+	if step then
+		if dist(x, z, goal.x, goal.z) < 45 and Grid.walkable(x, z, goal.x, goal.z) then
+			f.wayX, f.wayZ = goal.x, goal.z
+		else
+			f.wayX, f.wayZ = step.x, step.z
+		end
+	end
+	Bots.fight(f, t, enemy, ed)
+end
+
+-- Moves one bot for one frame.
+function Bots.move(f, dt, t)
+	local speed = WALK
+	if t < f.overdriveUntil then
+		speed = speed * 1.4
+	end
+	if t < f.hasteUntil then
+		speed = speed * 1.35
+	end
+	local mx, mz = 0, 0
+	if t < f.dashUntil then
+		mx, mz = f.dashX * 95, f.dashZ * 95
+	elseif f.wayX then
+		local dx, dz = f.wayX - f.x, f.wayZ - f.z
+		local d = math.sqrt(dx * dx + dz * dz)
+		if d > 0.7 then
+			mx, mz = dx / d * speed, dz / d * speed
+			f.faceX, f.faceZ = dx / d, dz / d
+		else
+			f.wayX, f.wayZ = nil, nil
+			f.nextThink = 0
+		end
+	end
+	local decay = math.exp(-4 * dt)
+	f.kvx, f.kvz = f.kvx * decay, f.kvz * decay
+	local pushed = math.abs(f.kvx) + math.abs(f.kvz) > 6
+	local nx, nz = f.x + (mx + f.kvx) * dt, f.z + (mz + f.kvz) * dt
+	local grounded = f.y <= BOT_REST + 0.05 and f.vy <= 0
+	local tile = Grid.tileAt(nx, nz)
+	if tile and tile.kind == 2 and f.y < FLOOR_Y + 11 then
+		-- pillars are walls
+		nx, nz = f.x, f.z
+		f.kvx, f.kvz = 0, 0
+		f.wayX, f.wayZ = nil, nil
+		tile = Grid.tileAt(nx, nz)
+	elseif not tile and grounded and not pushed then
+		-- bots never step off an edge on their own: only a knock-back can throw them out
+		nx, nz = f.x, f.z
+		f.wayX, f.wayZ = nil, nil
+		f.dashUntil = 0
+		tile = Grid.tileAt(nx, nz)
+	end
+	f.x, f.z = nx, nz
+	local overFloor = tile ~= nil and tile.kind == 1
+	if f.vy ~= 0 or not overFloor or f.y > BOT_REST then
+		f.vy = f.vy - 150 * dt
+		f.y = f.y + f.vy * dt
+		if overFloor and f.vy <= 0 and f.y <= BOT_REST and f.y > BOT_REST - 2.5 then
+			f.y = BOT_REST
+			f.vy = 0
+		end
+	end
+	if f.y < KILL_Y then
+		Combat.down(f)
+		return
+	end
+	f.part.CFrame = CFrame.new(f.x, f.y, f.z)
+end
+
+function Bots.frame(dt)
+	local t = now()
+	for _, f in ipairs(Fighters.list) do
+		if f.isBot and f.alive then
+			Bots.move(f, dt, t)
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Modes: how each kind of match is scored
+---------------------------------------------------------------------------------------------------
+
+function Modes.start(mode)
+	G.mode = mode
+	G.score = { 0, 0 }
+	G.rush = false
+	G.goal = GOAL[mode]
+	G.secAcc = 0
+	if mode == "Beacons" then
+		Grid.placeBeacons()
+	end
+	shared:SetAttribute("Mode", mode)
+	shared:SetAttribute("Goal", G.goal)
+	shared:SetAttribute("Rush", false)
+end
+
+function Modes.onKO(team)
+	if G.mode == "KO" then
+		G.score[team] = G.score[team] + (G.rush and 2 or 1)
+	end
+end
+
+-- Once a second while a match is on.
+function Modes.second()
+	if G.mode ~= "Beacons" then
+		return
+	end
+	for _, b in ipairs(Grid.beacons) do
+		local c1, c2 = 0, 0
+		for _, t in ipairs(b.cluster) do
+			if t.owner == 1 then
+				c1 = c1 + 1
+			elseif t.owner == 2 then
+				c2 = c2 + 1
+			end
+		end
+		local need = math.floor(#b.cluster / 2) + 1
+		local owner = 0
+		if c1 >= need then
+			owner = 1
+		elseif c2 >= need then
+			owner = 2
+		end
+		if owner ~= b.owner then
+			b.owner = owner
+			b.pole.Color = owner > 0 and TEAM_COLOR[owner] or NEUTRAL
+		end
+		if owner > 0 then
+			G.score[owner] = G.score[owner] + (G.rush and 2 or 1)
+		end
+	end
+end
+
+function Modes.scores()
+	if G.mode == "Turf" then
+		return Grid.count[1], Grid.count[2]
+	end
+	return G.score[1], G.score[2]
+end
+
+function Modes.finished()
+	if G.goal <= 0 then
+		return false
+	end
+	local a, b = Modes.scores()
+	return a >= G.goal or b >= G.goal
+end
+
+---------------------------------------------------------------------------------------------------
+-- Profiles: what is saved for each player
+---------------------------------------------------------------------------------------------------
+
+Profiles.data = {}
+Profiles.store = nil
+pcall(function()
+	Profiles.store = DataStoreService:GetDataStore("NeonCanvas_v1")
+end)
+
+local NUMBER_FIELDS = { "lvl", "xp", "rating", "coins", "wins", "matches", "kos", "dots" }
+
+function Profiles.need(lvl)
+	return CONFIG.xpBase + CONFIG.xpStep * (lvl - 1)
+end
+
+function Profiles.unlocked(profile, def)
+	return def ~= nil and profile.lvl >= def.unlock
+end
+
+function Profiles.load(player)
+	local p = {
+		lvl = 1, xp = 0, rating = 0, coins = 0, wins = 0, matches = 0, kos = 0, dots = 0,
+		primary = "bolt", a1 = "nova", a2 = "shield", title = "rookie", titles = { rookie = true },
+	}
+	if not Profiles.store then
+		return p
+	end
+	local ok, saved = pcall(function()
+		return Profiles.store:GetAsync("p_" .. player.UserId)
+	end)
+	if not ok or type(saved) ~= "table" then
+		return p
+	end
+	for _, key in ipairs(NUMBER_FIELDS) do
+		local v = tonumber(saved[key])
+		if v and v == v and v >= 0 and v < 1e9 then
+			p[key] = math.floor(v)
+		end
+	end
+	p.lvl = math.clamp(p.lvl, 1, CONFIG.levelCap)
+	if type(saved.titles) == "table" then
+		for id, owned in pairs(saved.titles) do
+			if owned == true and CONFIG.titles[id] then
+				p.titles[id] = true
+			end
+		end
+	end
+	if type(saved.title) == "string" and p.titles[saved.title] then
+		p.title = saved.title
+	end
+	if type(saved.primary) == "string" and Profiles.unlocked(p, CONFIG.primaries[saved.primary]) then
+		p.primary = saved.primary
+	end
+	if type(saved.a1) == "string" and Profiles.unlocked(p, CONFIG.abilities[saved.a1]) then
+		p.a1 = saved.a1
+	end
+	if type(saved.a2) == "string" and saved.a2 ~= p.a1 and Profiles.unlocked(p, CONFIG.abilities[saved.a2]) then
+		p.a2 = saved.a2
+	end
+	if p.a1 == p.a2 then
+		p.a2 = p.a1 == "nova" and "shield" or "nova"
+	end
+	return p
+end
+
+function Profiles.save(player)
+	local p = Profiles.data[player]
+	if not p or not Profiles.store then
+		return
+	end
+	local out = { primary = p.primary, a1 = p.a1, a2 = p.a2, title = p.title, titles = p.titles }
+	for _, key in ipairs(NUMBER_FIELDS) do
+		out[key] = p[key]
+	end
+	pcall(function()
+		Profiles.store:SetAsync("p_" .. player.UserId, out)
+	end)
+end
+
+-- Copies a profile onto the player as attributes, which is how the client reads it.
+function Profiles.sync(player)
+	local p = Profiles.data[player]
+	if not p then
+		return
+	end
+	player:SetAttribute("Lvl", p.lvl)
+	player:SetAttribute("XP", p.xp)
+	player:SetAttribute("XPNeed", Profiles.need(p.lvl))
+	player:SetAttribute("Rating", p.rating)
+	player:SetAttribute("Coins", p.coins)
+	player:SetAttribute("Wins", p.wins)
+	player:SetAttribute("Matches", p.matches)
+	player:SetAttribute("KOs", p.kos)
+	player:SetAttribute("Dots", p.dots)
+	player:SetAttribute("Primary", p.primary)
+	player:SetAttribute("A1", p.a1)
+	player:SetAttribute("A2", p.a2)
+	player:SetAttribute("Title", p.title)
+	local owned = {}
+	for _, id in ipairs(CONFIG.titleOrder) do
+		if p.titles[id] then
+			table.insert(owned, id)
+		end
+	end
+	player:SetAttribute("Titles", table.concat(owned, ","))
+end
+
+function Profiles.applyLoadout(player)
+	local p = Profiles.data[player]
+	local f = Fighters.byPlayer[player]
+	if p and f then
+		f.loadout.primary, f.loadout.a1, f.loadout.a2 = p.primary, p.a1, p.a2
+	end
+end
+
+-- Gives match rewards and returns what changed, for the results card.
+function Profiles.reward(player, f, outcome)
+	local p = Profiles.data[player]
+	if not p then
+		return nil
+	end
+	local xp = 30 + math.min(160, math.floor(f.stats.tiles * 0.35)) + f.stats.kos * 12
+	local ratingDelta
+	if outcome == "win" then
+		xp = xp + 50
+		ratingDelta = 20
+		p.wins = p.wins + 1
+	elseif outcome == "draw" then
+		xp = xp + 25
+		ratingDelta = 5
+	else
+		xp = xp + 12
+		ratingDelta = 0 - math.min(12, p.rating)
+	end
+	local coins = math.floor(xp / 4)
+	local before = p.lvl
+	p.matches = p.matches + 1
+	p.kos = p.kos + f.stats.kos
+	p.dots = p.dots + f.stats.tiles
+	p.coins = p.coins + coins
+	p.rating = p.rating + ratingDelta
+	p.xp = p.xp + xp
+	local unlocks = {}
+	while p.lvl < CONFIG.levelCap and p.xp >= Profiles.need(p.lvl) do
+		p.xp = p.xp - Profiles.need(p.lvl)
+		p.lvl = p.lvl + 1
+		for _, id in ipairs(CONFIG.primaryOrder) do
+			if CONFIG.primaries[id].unlock == p.lvl then
+				table.insert(unlocks, CONFIG.primaries[id].name)
+			end
+		end
+		for _, id in ipairs(CONFIG.abilityOrder) do
+			if CONFIG.abilities[id].unlock == p.lvl then
+				table.insert(unlocks, CONFIG.abilities[id].name)
+			end
+		end
+	end
+	Profiles.sync(player)
+	return { xp = xp, coins = coins, ratingDelta = ratingDelta, rating = p.rating, lvl0 = before, lvl1 = p.lvl, unlocks = unlocks }
+end
+
+requestEvent.OnServerEvent:Connect(function(player, kind, a, b)
+	local p = Profiles.data[player]
+	if not p or type(kind) ~= "string" or type(a) ~= "string" then
+		return
+	end
+	if kind == "loadout" and type(b) == "string" then
+		if a == "primary" then
+			if Profiles.unlocked(p, CONFIG.primaries[b]) then
+				p.primary = b
+			end
+		elseif a == "a1" or a == "a2" then
+			if Profiles.unlocked(p, CONFIG.abilities[b]) then
+				local other = a == "a1" and "a2" or "a1"
+				if p[other] == b then
+					p[other] = p[a]
+				end
+				p[a] = b
+			end
+		end
+		Profiles.applyLoadout(player)
+		local f = Fighters.byPlayer[player]
+		if f and G.state == "Playing" then
+			-- no swapping to dodge a cooldown
+			local t = now()
+			f.ready.a1 = math.max(f.ready.a1, t + 3)
+			f.ready.a2 = math.max(f.ready.a2, t + 3)
+		end
+		Profiles.sync(player)
+	elseif kind == "title" then
+		local def = CONFIG.titles[a]
+		if def then
+			if not p.titles[a] and p.coins >= def.cost then
+				p.coins = p.coins - def.cost
+				p.titles[a] = true
+			end
+			if p.titles[a] then
+				p.title = a
+				local info = live[player]
+				if info then
+					local f = Fighters.byPlayer[player]
+					Fighters.decorate(info, player, f and f.team or 0)
+				end
+			end
+			Profiles.sync(player)
+		end
+	end
+end)
+
+---------------------------------------------------------------------------------------------------
+-- Match: the round loop
+---------------------------------------------------------------------------------------------------
+
+function Match.setState(state, duration)
+	G.state = state
+	G.endsAt = now() + duration
+	shared:SetAttribute("EndsAt", G.endsAt)
+	shared:SetAttribute("State", state)
+end
+
+function Match.syncScore()
+	local a, b = Modes.scores()
+	if a ~= G.sentA then
+		G.sentA = a
+		shared:SetAttribute("ScoreA", a)
+	end
+	if b ~= G.sentB then
+		G.sentB = b
+		shared:SetAttribute("ScoreB", b)
+	end
+end
+
+function Match.teamCount(team, humansOnly)
+	local n = 0
+	for _, f in ipairs(Fighters.list) do
+		if f.team == team and (not humansOnly or not f.isBot) then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+function Match.addBot(team)
+	local used = {}
+	for _, f in ipairs(Fighters.list) do
+		used[f.name] = true
+	end
+	local name = "Bot"
+	for _ = 1, 40 do
+		local candidate = BOT_NAMES[rng:NextInteger(1, #BOT_NAMES)]
+		if not used[candidate] then
+			name = candidate
+			break
+		end
+	end
+	local f = Fighters.new(team, nil, name)
+	local base = Match.botSkill()
+	f.skill = math.clamp(base + rng:NextNumber(-0.18, 0.18), 0.1, 0.95)
+	local a = rng:NextInteger(1, #CONFIG.abilityOrder)
+	local b = rng:NextInteger(1, #CONFIG.abilityOrder - 1)
+	if b >= a then
+		b = b + 1
+	end
+	f.loadout.primary = CONFIG.primaryOrder[rng:NextInteger(1, #CONFIG.primaryOrder)]
+	f.loadout.a1 = CONFIG.abilityOrder[a]
+	f.loadout.a2 = CONFIG.abilityOrder[b]
+	Fighters.spawnBot(f)
+	return f
+end
+
+-- How good the computer players are. New players meet easy ones; it rises with level and rating.
+function Match.botSkill()
+	local total, n = 0, 0
+	for _, p in pairs(Profiles.data) do
+		total = total + 0.28 + p.lvl * 0.03 + p.rating / 2500
+		n = n + 1
+	end
+	if n == 0 then
+		return 0.4
+	end
+	return math.clamp(total / n, 0.28, 0.78)
+end
+
+function Match.addHuman(player, team)
+	local f = Fighters.new(team, player)
+	Profiles.applyLoadout(player)
+	player.RespawnLocation = World.pad[team]
+	return f
+end
+
+function Match.assignTeams()
+	local humans = Players:GetPlayers()
+	for i = #humans, 2, -1 do
+		local j = rng:NextInteger(1, i)
+		humans[i], humans[j] = humans[j], humans[i]
+	end
+	local first = rng:NextInteger(1, 2)
+	for i, player in ipairs(humans) do
+		local team = (i % 2 == 1) and first or (3 - first)
+		Match.addHuman(player, team)
+	end
+	local size = math.max(TEAM_SIZE, math.ceil(#humans / 2))
+	for team = 1, 2 do
+		for _ = Match.teamCount(team) + 1, size do
+			Match.addBot(team)
+		end
+	end
+end
+
+-- A player who arrives in the middle of a match takes over a computer player's seat.
+function Match.joinLate(player)
+	if Fighters.byPlayer[player] then
+		return
+	end
+	local a, b = Match.teamCount(1, true), Match.teamCount(2, true)
+	local team
+	if a ~= b then
+		team = a < b and 1 or 2
+	else
+		team = rng:NextInteger(1, 2)
+	end
+	local weakest = nil
+	for _, f in ipairs(Fighters.list) do
+		if f.isBot and f.team == team and (not weakest or f.stats.tiles < weakest.stats.tiles) then
+			weakest = f
+		end
+	end
+	if weakest then
+		Fighters.remove(weakest)
+	end
+	Match.addHuman(player, team)
+	Fighters.place(player)
+end
+
+function Match.cleanup()
+	for i = #Fighters.list, 1, -1 do
+		local f = Fighters.list[i]
+		if f then
+			Fighters.remove(f)
+		end
+	end
+	Fighters.list = {}
+	Fighters.byPlayer = {}
+	Shots.list = {}
+	Props.list = {}
+	Power.list = {}
+	World.Props:ClearAllChildren()
+	World.Bots:ClearAllChildren()
+	for _, player in ipairs(Players:GetPlayers()) do
+		player:SetAttribute("Team", 0)
+		player:SetAttribute("Ult", 0)
+		player.RespawnLocation = World.lobbyPad
+	end
+end
+
+-- Works out the winner, hands out rewards and sends everyone their results card.
+function Match.finish()
+	local a, b = Modes.scores()
+	local winner = 0
+	if a > b then
+		winner = 1
+	elseif b > a then
+		winner = 2
+	end
+	local rows = {}
+	for _, f in ipairs(Fighters.list) do
+		table.insert(rows, {
+			id = f.id, n = f.name, t = f.team, b = f.isBot, d = f.stats.tiles, k = f.stats.kos, x = f.stats.deaths,
+			s = f.stats.tiles + f.stats.kos * 12,
+		})
+	end
+	table.sort(rows, function(p, q)
+		if p.s ~= q.s then
+			return p.s > q.s
+		end
+		return p.id < q.id
+	end)
+	if rows[1] then
+		rows[1].mvp = true
+	end
+	for _, f in ipairs(Fighters.list) do
+		if f.player and f.player.Parent then
+			local outcome = "loss"
+			if winner == 0 then
+				outcome = "draw"
+			elseif winner == f.team then
+				outcome = "win"
+			end
+			local reward = Profiles.reward(f.player, f, outcome)
+			resultsEvent:FireClient(f.player, {
+				winner = winner, a = a, b = b, mode = G.mode, total = Grid.floorCount, team = f.team, me = f.id,
+				rows = rows, reward = reward,
+			})
+			task.spawn(Profiles.save, f.player)
+		end
+	end
+	feedEvent:FireAllClients("end", winner)
+end
+
+function Match.wait()
+	while now() < G.endsAt do
+		task.wait(0.2)
+	end
+end
+
+function Match.cycle()
+	G.round = G.round + 1
+	shared:SetAttribute("Round", G.round)
+	local def = MAPS[(G.round - 1) % #MAPS + 1]
+	local mode = MODE_ORDER[(G.round - 1) % #MODE_ORDER + 1]
+
+	-- intermission: fresh map, everyone waits on the deck
+	Match.cleanup()
+	Grid.build(def)
+	G.mode = mode
+	G.score = { 0, 0 }
+	G.rush = false
+	G.goal = GOAL[mode]
+	shared:SetAttribute("Mode", mode)
+	shared:SetAttribute("Goal", G.goal)
+	shared:SetAttribute("Rush", false)
+	World.setDeck(true)
+	Match.setState("Intermission", TIME.intermission)
+	for _, player in ipairs(Players:GetPlayers()) do
+		Fighters.place(player)
+	end
+	Match.wait()
+	if #Players:GetPlayers() == 0 then
+		-- an empty server idles here until somebody arrives, then gives them time to read the menu
+		while #Players:GetPlayers() == 0 do
+			task.wait(1)
+		end
+		Match.setState("Intermission", 10)
+		Match.wait()
+	end
+
+	-- countdown: teams are made and everyone stands at their base
+	Modes.start(mode)
+	Match.assignTeams()
+	for team = 1, 2 do
+		local base = Grid.baseTile[team]
+		Grid.paintCircle(team, base.x, base.z, 15, nil)
+	end
+	Match.setState("Countdown", TIME.countdown)
+	for _, player in ipairs(Players:GetPlayers()) do
+		Fighters.place(player)
+	end
+	World.setDeck(false)
+	Match.wait()
+
+	-- the match itself
+	Power.nextAt = now() + 8
+	Match.setState("Playing", TIME.match)
+	feedEvent:FireAllClients("start", mode)
+	while now() < G.endsAt and not Modes.finished() do
+		if not G.rush and G.endsAt - now() <= TIME.rush then
+			G.rush = true
+			shared:SetAttribute("Rush", true)
+			feedEvent:FireAllClients("rush")
+		end
+		task.wait(0.2)
+	end
+
+	-- results: the finished painting is shown from above, so name tags of bots step aside
+	Match.setState("Results", TIME.results)
+	Shots.list = {}
+	for _, f in ipairs(Fighters.list) do
+		if f.isBot and f.plate then
+			f.plate.Enabled = false
+		end
+	end
+	Match.syncScore()
+	Match.finish()
+	Match.wait()
+end
+
+-- Ten times a second: painting by walking, healing, falls, respawns and bot decisions.
+function Match.slowTick(step)
+	local t = now()
+	local playing = G.state == "Playing"
+	for _, f in ipairs(Fighters.list) do
+		if f.alive then
+			local x, y, z = Fighters.pos(f)
+			if x then
+				if f.lastX then
+					f.velX, f.velZ = (x - f.lastX) / step, (z - f.lastZ) / step
+					if not f.isBot then
+						local sp = f.velX * f.velX + f.velZ * f.velZ
+						if sp > 4 then
+							local m = math.sqrt(sp)
+							f.faceX, f.faceZ = f.velX / m, f.velZ / m
+						end
+					end
+				end
+				if playing then
+					if y > FLOOR_Y - 1 and y < FLOOR_Y + 5.5 then
+						local boosts = 0
+						if t < f.overdriveUntil then
+							boosts = boosts + 1
+						end
+						if t < f.surgeUntil then
+							boosts = boosts + 1
+						end
+						if G.rush then
+							boosts = boosts + 1
+						end
+						local wide = 0
+						if boosts >= 2 then
+							wide = 11
+						elseif boosts == 1 then
+							wide = 7.4
+						elseif t < f.dashPaintUntil then
+							wide = 4.6
+						end
+						if f.lastX and dist(f.lastX, f.lastZ, x, z) < 30 then
+							Grid.paintLine(f.team, f.lastX, f.lastZ, x, z, wide, f)
+						else
+							Grid.paintLine(f.team, x, z, x, z, wide, f)
+						end
+					end
+					if t - f.lastHitAt > 4 then
+						Combat.heal(f, 6 * step)
+					end
+					if not f.isBot and y < KILL_Y then
+						Combat.down(f)
+					end
+				end
+				f.lastX, f.lastZ = x, z
+				if not f.isBot and f.hum and f.alive then
+					local want = WALK
+					if G.state == "Countdown" then
+						want = 0
+					else
+						if t < f.overdriveUntil then
+							want = want * 1.4
+						end
+						if t < f.hasteUntil then
+							want = want * 1.35
+						end
+					end
+					if math.abs(f.hum.WalkSpeed - want) > 0.01 then
+						f.hum.WalkSpeed = want
+					end
+				end
+			end
+		elseif f.isBot and playing and t >= f.respawnAt then
+			Fighters.spawnBot(f)
+		end
+		if f.player then
+			local u = math.floor(f.ult)
+			if u ~= f.ultSent then
+				f.ultSent = u
+				f.player:SetAttribute("Ult", u)
+			end
+		end
+		if playing and f.isBot and f.alive and t >= f.nextThink then
+			guard("bot", Bots.think, f, t)
+		end
+	end
+	if playing then
+		Props.step(t)
+		Power.step(t)
+		G.secAcc = G.secAcc + step
+		if G.secAcc >= 1 then
+			G.secAcc = G.secAcc - 1
+			Modes.second()
+		end
+	end
+	if G.state ~= "Intermission" and G.state ~= "Boot" then
+		Match.syncScore()
+	end
+	-- outside a match nobody can be knocked out: anyone who falls is simply put back
+	if not playing then
+		for player, info in pairs(live) do
+			if info.root.Parent and info.root.Position.Y < KILL_Y then
+				Fighters.place(player)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Players joining and leaving
+---------------------------------------------------------------------------------------------------
+
+local function onPlayerAdded(player)
+	player:SetAttribute("Team", 0)
+	player:SetAttribute("Ult", 0)
+	player.RespawnLocation = World.lobbyPad
+	if G.state == "Countdown" or G.state == "Playing" then
+		Match.joinLate(player)
+	end
+	player.CharacterAdded:Connect(function(character)
+		Fighters.bindCharacter(player, character)
+	end)
+	if player.Character then
+		task.spawn(Fighters.bindCharacter, player, player.Character)
+	end
+	local profile = Profiles.load(player)
+	if not player.Parent then
+		return
+	end
+	Profiles.data[player] = profile
+	Profiles.sync(player)
+	Profiles.applyLoadout(player)
+	local info = live[player]
+	if info then
+		local f = Fighters.byPlayer[player]
+		Fighters.decorate(info, player, f and f.team or 0)   -- now that the title is known
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	local f = Fighters.byPlayer[player]
+	if f then
+		local team = f.team
+		Fighters.remove(f)
+		if G.state == "Countdown" or G.state == "Playing" then
+			Match.addBot(team)
+		end
+	end
+	live[player] = nil
+	Profiles.save(player)
+	Profiles.data[player] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		Profiles.save(player)
+	end
+end)
+
+---------------------------------------------------------------------------------------------------
+-- Start
+---------------------------------------------------------------------------------------------------
+
+Players.RespawnTime = RESPAWN
+World.build()
+Grid.build(MAPS[1])
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
+
+local slowAcc = 0
+RunService.Heartbeat:Connect(function(dt)
+	if dt > 0.1 then
+		dt = 0.1
+	end
+	if G.state == "Playing" then
+		guard("shots", Shots.step, dt)
+		guard("bots", Bots.frame, dt)
+	end
+	slowAcc = slowAcc + dt
+	if slowAcc >= 0.1 then
+		local step = slowAcc
+		slowAcc = 0
+		guard("tick", Match.slowTick, step)
+	end
+end)
+
+while true do
+	local ok, err = pcall(Match.cycle)
+	if not ok then
+		warn("[NeonCanvas] round error: " .. tostring(err))
+		task.wait(3)
+	end
+end
+]]></ProtectedString></Properties></Item></Item><Item class="StarterPlayer" referent="RBX3"><Properties><string name="Name">StarterPlayer</string></Properties><Item class="StarterPlayerScripts" referent="RBX4"><Properties><string name="Name">StarterPlayerScripts</string></Properties><Item class="LocalScript" referent="RBX5"><Properties><string name="Name">NeonCanvasClient</string><ProtectedString name="Source"><![CDATA[-- NEON CANVAS: client script (goes in StarterPlayer > StarterPlayerScripts).
+--
+-- Everything the player sees and touches: the top-down camera, aiming and input, the glowing
+-- floor, effects, sounds, the HUD, the menu and the results card. All rules live in the server
+-- script; this one only draws and sends requests.
+--
+-- Written in plain Lua 5.1 syntax so the offline test harness in roblox/test can run it.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
+local SoundService = game:GetService("SoundService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local shared = ReplicatedStorage:WaitForChild("NeonCanvas")
+local world = workspace:WaitForChild("NeonCanvas")
+local CONFIG = HttpService:JSONDecode(shared:WaitForChild("Config").Value)
+local actEvent = shared:WaitForChild("Act")
+local requestEvent = shared:WaitForChild("Request")
+local fxEvent = shared:WaitForChild("FX")
+local feedEvent = shared:WaitForChild("Feed")
+local hurtEvent = shared:WaitForChild("Hurt")
+local resultsEvent = shared:WaitForChild("Results")
+
+local SOUND_ON = true            -- set to false to silence the game
+local FLOOR = CONFIG.floorY
+
+---------------------------------------------------------------------------------------------------
+-- Theme and small helpers
+---------------------------------------------------------------------------------------------------
+
+local function rgb(t)
+	return Color3.fromRGB(t[1], t[2], t[3])
+end
+
+local C = {
+	ink = Color3.fromRGB(13, 15, 28),
+	card = Color3.fromRGB(32, 36, 64),
+	cardHi = Color3.fromRGB(54, 60, 102),
+	text = Color3.fromRGB(245, 246, 255),
+	muted = Color3.fromRGB(150, 156, 196),
+	gold = Color3.fromRGB(255, 214, 102),
+	good = Color3.fromRGB(110, 236, 160),
+	bad = Color3.fromRGB(255, 92, 110),
+	white = Color3.fromRGB(255, 255, 255),
+	team = { rgb(CONFIG.teamColors[1]), rgb(CONFIG.teamColors[2]) },
+}
+local BLACK, BOLD, MEDIUM = Enum.Font.GothamBlack, Enum.Font.GothamBold, Enum.Font.GothamMedium
+local SMOOTH, NEON = Enum.Material.SmoothPlastic, Enum.Material.Neon
+local UPRIGHT = CFrame.Angles(0, 0, math.rad(90))
+local CENTER = Enum.TextXAlignment.Center
+
+local UI, Sfx, Tiles, BotView, Fx, Cam, Input, Hud, Menu, Results = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+
+-- the local player's character, refreshed every time they respawn
+local me = { character = nil, root = nil, hum = nil, diedAt = 0, killer = nil }
+
+local function serverNow()
+	return workspace:GetServerTimeNow()
+end
+
+local function phase()
+	return shared:GetAttribute("State") or "Boot"
+end
+
+local function myTeam()
+	return player:GetAttribute("Team") or 0
+end
+
+local function alive()
+	return me.hum ~= nil and me.root ~= nil and me.root.Parent ~= nil and me.hum.Health > 0
+end
+
+local function hex(color)
+	return string.format("#%02x%02x%02x", math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5),
+		math.floor(color.B * 255 + 0.5))
+end
+
+local function escape(text)
+	text = string.gsub(text, "&", "&amp;")
+	text = string.gsub(text, "<", "&lt;")
+	text = string.gsub(text, ">", "&gt;")
+	return text
+end
+
+local function teamColor(team)
+	return C.team[team] or C.white
+end
+
+local warned = 0
+local function guard(label, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok and warned < 20 then
+		warned = warned + 1
+		warn("[NeonCanvas] " .. label .. ": " .. tostring(err))
+	end
+end
+
+local function bindCharacter(character)
+	me.character, me.root, me.hum = character, nil, nil
+	task.spawn(function()
+		local hum = character:WaitForChild("Humanoid", 15)
+		local root = character:WaitForChild("HumanoidRootPart", 15)
+		if me.character ~= character or not hum or not root then
+			return
+		end
+		me.hum, me.root = hum, root
+		hum.Died:Connect(function()
+			if me.hum == hum then
+				me.diedAt = os.clock()
+			end
+		end)
+	end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- UI building blocks
+---------------------------------------------------------------------------------------------------
+
+function UI.new(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+function UI.corner(inst, radius)
+	return UI.new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+
+function UI.round(inst)
+	return UI.new("UICorner", { CornerRadius = UDim.new(1, 0) }, inst)
+end
+
+function UI.stroke(inst, color, thickness, transparency)
+	return UI.new("UIStroke", {
+		Color = color or C.white,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0.86,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, inst)
+end
+
+function UI.frame(parent, props)
+	props.BorderSizePixel = 0
+	if props.BackgroundColor3 == nil and props.BackgroundTransparency == nil then
+		props.BackgroundTransparency = 1
+	end
+	return UI.new("Frame", props, parent)
+end
+
+-- dark glass panel
+function UI.panel(parent, props, radius)
+	props.BackgroundColor3 = props.BackgroundColor3 or C.ink
+	props.BackgroundTransparency = props.BackgroundTransparency or 0.14
+	local f = UI.frame(parent, props)
+	UI.corner(f, radius or 18)
+	UI.stroke(f)
+	return f
+end
+
+function UI.label(parent, text, size, font, color, props)
+	local base = {
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Text = text,
+		TextSize = size,
+		Font = font or MEDIUM,
+		TextColor3 = color or C.text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Size = UDim2.new(1, 0, 0, size + 6),
+	}
+	if props then
+		for k, v in pairs(props) do
+			base[k] = v
+		end
+	end
+	return UI.new("TextLabel", base, parent)
+end
+
+function UI.button(parent, text, props, fill)
+	local base = {
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Text = text,
+		TextSize = 13,
+		Font = BOLD,
+		TextColor3 = fill and C.ink or C.text,
+		BackgroundColor3 = fill or C.card,
+		Size = UDim2.new(0, 110, 0, 32),
+	}
+	if props then
+		for k, v in pairs(props) do
+			base[k] = v
+		end
+	end
+	local b = UI.new("TextButton", base, parent)
+	UI.round(b)
+	if not fill then
+		UI.stroke(b)
+	end
+	b.Activated:Connect(function()
+		Sfx.play("click")
+	end)
+	return b
+end
+
+-- Small pictograms drawn from dots, bars and rings, so no image files are needed.
+-- Coordinates run from -1 to 1 across the holder.
+local ICONS = {
+	bolt = { { "bar", -0.2, 0.2, 1.0, 0.24, -45 }, { "dot", 0.4, -0.4, 0.32 } },
+	scatter = { { "dot", -0.55, -0.3, 0.2 }, { "dot", 0, -0.55, 0.2 }, { "dot", 0.55, -0.3, 0.2 }, { "dot", 0, 0.45, 0.3 } },
+	lob = { { "dot", 0.5, -0.15, 0.32 }, { "dot", -0.65, 0.55, 0.1 }, { "dot", -0.38, 0.08, 0.13 }, { "dot", 0, -0.3, 0.16 } },
+	dash = { { "bar", -0.1, -0.42, 1.2, 0.18, 0 }, { "bar", 0.15, 0, 1.2, 0.18, 0 }, { "bar", -0.1, 0.42, 1.2, 0.18, 0 } },
+	nova = { { "ring", 0, 0, 0.85 }, { "dot", 0, 0, 0.3 } },
+	shield = { { "ring", 0, 0, 0.9 }, { "ring", 0, 0, 0.5 } },
+	mine = { { "bar", 0, 0, 1.6, 0.16, 0 }, { "bar", 0, 0, 1.6, 0.16, 90 }, { "bar", 0, 0, 1.3, 0.16, 45 },
+		{ "bar", 0, 0, 1.3, 0.16, -45 }, { "dot", 0, 0, 0.44 } },
+	vortex = { { "ring", 0, 0, 0.9 }, { "ring", 0.12, 0.08, 0.55 }, { "dot", 0.2, 0.14, 0.16 } },
+	beam = { { "bar", 0.1, -0.1, 1.7, 0.32, -45 }, { "dot", -0.6, 0.6, 0.24 } },
+	blink = { { "dot", -0.5, 0.5, 0.22 }, { "bar", 0, 0, 0.5, 0.12, -45 }, { "dot", 0.5, -0.5, 0.36 } },
+	mend = { { "bar", 0, 0, 1.4, 0.4, 0 }, { "bar", 0, 0, 0.4, 1.4, 0 } },
+	overdrive = { { "bar", -0.24, -0.3, 0.75, 0.2, -45 }, { "bar", 0.24, -0.3, 0.75, 0.2, 45 },
+		{ "bar", -0.24, 0.3, 0.75, 0.2, -45 }, { "bar", 0.24, 0.3, 0.75, 0.2, 45 } },
+	ult = { { "bar", 0, 0, 1.9, 0.16, 0 }, { "bar", 0, 0, 1.9, 0.16, 90 }, { "bar", 0, 0, 1.5, 0.16, 45 },
+		{ "bar", 0, 0, 1.5, 0.16, -45 }, { "dot", 0, 0, 0.42 } },
+}
+
+function UI.icon(holder, kind, color)
+	holder:ClearAllChildren()
+	local shapes = ICONS[kind]
+	if not shapes then
+		return
+	end
+	for _, s in ipairs(shapes) do
+		local what, x, y = s[1], s[2], s[3]
+		local props = {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5 + x / 2, 0, 0.5 + y / 2, 0),
+			BackgroundColor3 = color,
+		}
+		if what == "bar" then
+			props.Size = UDim2.new(s[4] / 2, 0, s[5] / 2, 0)
+			props.Rotation = s[6]
+		else
+			props.Size = UDim2.new(s[4], 0, s[4], 0)
+		end
+		if what == "ring" then
+			props.BackgroundTransparency = 1
+		end
+		local f = UI.frame(holder, props)
+		UI.round(f)
+		if what == "ring" then
+			UI.stroke(f, color, 2.5, 0)
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Sounds: only files that ship inside every Roblox client
+---------------------------------------------------------------------------------------------------
+
+Sfx.defs = {
+	fire = { "snap", 1.7, 0.22 },
+	pellets = { "snap", 1.2, 0.26 },
+	lob = { "swordlunge", 1.25, 0.3 },
+	dash = { "swordslash", 1.5, 0.3 },
+	cast = { "unsheath", 1.35, 0.35 },
+	splat = { "splat", 1.4, 0.12 },
+	boom = { "collide", 1, 0.32 },
+	ult = { "bass", 0.7, 0.6 },
+	hit = { "hit", 1.7, 0.3 },
+	hurt = { "hit", 0.85, 0.45 },
+	ping = { "electronicpingshort", 1.25, 0.35 },
+	tick = { "electronicpingshort", 0.8, 0.3 },
+	go = { "electronicpingshort", 1.6, 0.45 },
+	click = { "button", 1.3, 0.25 },
+	win = { "victory", 1, 0.45 },
+	lose = { "bass", 0.55, 0.5 },
+}
+Sfx.last = {}
+
+function Sfx.play(name)
+	local def = Sfx.defs[name]
+	if not SOUND_ON or not def then
+		return
+	end
+	local t = os.clock()
+	if Sfx.last[name] and t - Sfx.last[name] < 0.07 then
+		return
+	end
+	Sfx.last[name] = t
+	local sound = UI.new("Sound", {
+		SoundId = "rbxasset://sounds/" .. def[1] .. ".mp3",
+		PlaybackSpeed = def[2] * (0.96 + math.random() * 0.08),
+		Volume = def[3],
+	}, SoundService)
+	sound:Play()
+	task.delay(3, function()
+		sound:Destroy()
+	end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Tiles: the floor. The server only says who owns each dot; colours and animation happen here.
+---------------------------------------------------------------------------------------------------
+
+Tiles.recs = {}        -- [part] = record
+Tiles.anims = {}
+Tiles.show = false     -- true between matches, when the floor plays patterns
+Tiles.off = Color3.fromRGB(48, 52, 86)
+Tiles.acc = 0
+Tiles.folder = world:WaitForChild("Tiles")
+
+function Tiles.color(rec)
+	if rec.team > 0 then
+		return teamColor(rec.team)
+	end
+	if rec.beacon then
+		return Tiles.off:Lerp(C.white, 0.32)
+	end
+	return Tiles.off
+end
+
+function Tiles.animate(rec, delay)
+	if #Tiles.anims > 500 then
+		rec.part.Color = Tiles.color(rec)
+		rec.part.Material = rec.team > 0 and NEON or SMOOTH
+		return
+	end
+	table.insert(Tiles.anims, {
+		rec = rec, from = rec.part.Color, to = Tiles.color(rec), t = -(delay or 0), neon = rec.team > 0,
+	})
+end
+
+function Tiles.hook(part)
+	if not part:IsA("BasePart") or Tiles.recs[part] then
+		return
+	end
+	local p = part.Position
+	local rec = {
+		part = part, x = p.X, z = p.Z, d = math.sqrt(p.X * p.X + p.Z * p.Z), ang = math.atan2(p.Z, p.X),
+		phase = math.random() * 6.28, size = part.Size,
+		team = part:GetAttribute("T") or 0, beacon = part:GetAttribute("B") == true,
+	}
+	Tiles.recs[part] = rec
+	part:GetAttributeChangedSignal("T"):Connect(function()
+		rec.team = part:GetAttribute("T") or 0
+		if not Tiles.show then
+			Tiles.animate(rec)
+		end
+	end)
+	part:GetAttributeChangedSignal("B"):Connect(function()
+		rec.beacon = part:GetAttribute("B") == true
+		if not Tiles.show then
+			Tiles.animate(rec)
+		end
+	end)
+	if Tiles.show then
+		part.Material = NEON
+	else
+		part.Color = Tiles.color(rec)
+		part.Material = rec.team > 0 and NEON or SMOOTH
+	end
+end
+
+function Tiles.setShow(on)
+	if Tiles.show == on then
+		return
+	end
+	Tiles.show = on
+	for _, a in ipairs(Tiles.anims) do
+		if a.rec.part.Parent then
+			a.rec.part.Size = a.rec.size
+		end
+	end
+	Tiles.anims = {}
+	for part, rec in pairs(Tiles.recs) do
+		if on then
+			part.Material = NEON
+		else
+			Tiles.animate(rec, rec.d / 220)   -- the real colours roll out from the centre
+		end
+	end
+end
+
+-- Generative patterns for the intermission. A different one every round.
+function Tiles.pattern()
+	local t = os.clock()
+	local kind = (shared:GetAttribute("Round") or 0) % 4
+	local a, b = teamColor(1), teamColor(2)
+	for part, rec in pairs(Tiles.recs) do
+		local color
+		if kind == 0 then
+			local v = math.max(0, math.sin(rec.d * 0.09 - t * 2.2))
+			color = Color3.fromHSV(0.6 + 0.1 * math.sin(rec.d * 0.02 + t * 0.3), 0.6, 0.2 + 0.8 * v * v)
+		elseif kind == 1 then
+			local v = math.sin(rec.x * 0.05 + t * 1.3) * math.cos(rec.z * 0.06 - t * 0.9)
+			color = Color3.fromHSV(0.5 + 0.22 * v, 0.6, 0.25 + 0.75 * math.abs(v))
+		elseif kind == 2 then
+			local v = math.sin(rec.ang * 3 + rec.d * 0.07 - t * 2)
+			color = Tiles.off:Lerp(v > 0 and a or b, math.abs(v))
+		else
+			local v = math.max(0, math.sin(t * 1.7 + rec.phase)) ^ 6
+			color = Color3.fromHSV(0.72 + 0.14 * math.sin(rec.phase), 0.55, 0.22 + 0.78 * v)
+		end
+		part.Color = color
+	end
+end
+
+function Tiles.update(dt)
+	local anims = Tiles.anims
+	local i = 1
+	while i <= #anims do
+		local a = anims[i]
+		local part = a.rec.part
+		a.t = a.t + dt
+		local done = false
+		if not part.Parent then
+			done = true
+		elseif a.t >= 0 then
+			if not a.started then
+				a.started = true
+				part.Material = a.neon and NEON or SMOOTH
+			end
+			local k = a.t / 0.3
+			local size = a.rec.size
+			if k >= 1 then
+				part.Color = a.to
+				part.Size = size
+				done = true
+			else
+				local pop = 1 + 0.4 * math.sin(k * math.pi)
+				part.Color = a.from:Lerp(a.to, k)
+				part.Size = Vector3.new(size.X, size.Y * pop, size.Z * pop)
+			end
+		end
+		if done then
+			anims[i] = anims[#anims]
+			anims[#anims] = nil
+		else
+			i = i + 1
+		end
+	end
+	Tiles.acc = Tiles.acc + dt
+	if Tiles.acc >= 0.1 then
+		Tiles.acc = 0
+		if Tiles.show then
+			Tiles.pattern()
+		elseif phase() == "Results" then
+			-- the finished painting twinkles while the results are up
+			local n = 0
+			for _, rec in pairs(Tiles.recs) do
+				if rec.team > 0 and math.random() < 0.012 then
+					Tiles.animate(rec)
+					n = n + 1
+					if n >= 8 then
+						break
+					end
+				end
+			end
+		end
+	end
+end
+
+function Tiles.init()
+	local function readOff()
+		local off = Tiles.folder:GetAttribute("Off")
+		if typeof(off) == "Color3" then
+			Tiles.off = off
+		end
+	end
+	readOff()
+	Tiles.folder:GetAttributeChangedSignal("Off"):Connect(readOff)
+	Tiles.folder.ChildAdded:Connect(Tiles.hook)
+	Tiles.folder.ChildRemoved:Connect(function(part)
+		Tiles.recs[part] = nil
+	end)
+	for _, part in ipairs(Tiles.folder:GetChildren()) do
+		Tiles.hook(part)
+	end
+	Tiles.setShow(phase() == "Intermission" or phase() == "Boot")
+end
+
+---------------------------------------------------------------------------------------------------
+-- Effects: everything that flashes, flies or bursts
+---------------------------------------------------------------------------------------------------
+
+Fx.folder = UI.new("Folder", { Name = "NeonFx" }, workspace)
+Fx.list = {}      -- running effects
+Fx.bolts = {}     -- [id] = flying paint bolt
+Fx.shake = 0
+
+local function fxPart(shape, color, transparency, size)
+	return UI.new("Part", {
+		Shape = shape,
+		Size = size or Vector3.new(1, 1, 1),
+		Color = color,
+		Material = NEON,
+		Transparency = transparency or 0,
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		CastShadow = false,
+		TopSurface = Enum.SurfaceType.Smooth,
+		BottomSurface = Enum.SurfaceType.Smooth,
+	}, nil)
+end
+
+-- Runs step(part, k) every frame with k going 0 -> 1, then removes the part.
+function Fx.run(part, dur, step, delay)
+	table.insert(Fx.list, { part = part, t = -(delay or 0), dur = dur, step = step, on = false })
+end
+
+function Fx.disc(x, z, r0, r1, color, dur, y, alpha, delay)
+	alpha = alpha or 0.35
+	local part = fxPart(Enum.PartType.Cylinder, color, alpha, Vector3.new(0.2, r0 * 2, r0 * 2))
+	part.CFrame = CFrame.new(x, y or (FLOOR + 0.6), z) * UPRIGHT
+	Fx.run(part, dur, function(p, k)
+		local r = r0 + (r1 - r0) * (1 - (1 - k) * (1 - k))
+		p.Size = Vector3.new(0.2, r * 2, r * 2)
+		p.Transparency = alpha + (1 - alpha) * k
+	end, delay)
+end
+
+function Fx.orb(x, y, z, r0, r1, color, dur)
+	local part = fxPart(Enum.PartType.Ball, color, 0.45, Vector3.new(r0 * 2, r0 * 2, r0 * 2))
+	part.Position = Vector3.new(x, y, z)
+	Fx.run(part, dur, function(p, k)
+		local r = r0 + (r1 - r0) * (1 - (1 - k) * (1 - k))
+		p.Size = Vector3.new(r * 2, r * 2, r * 2)
+		p.Transparency = 0.45 + 0.55 * k
+	end)
+end
+
+function Fx.line(x0, z0, x1, z1, width, color, dur, y)
+	local a = Vector3.new(x0, y or (FLOOR + 2.4), z0)
+	local b = Vector3.new(x1, y or (FLOOR + 2.4), z1)
+	local length = (b - a).Magnitude
+	if length < 0.1 then
+		return
+	end
+	local part = fxPart(Enum.PartType.Block, color, 0.1, Vector3.new(width, width * 0.4, length))
+	part.CFrame = CFrame.new((a + b) / 2, b)
+	Fx.run(part, dur, function(p, k)
+		p.Size = Vector3.new(width * (1 - k), width * 0.4 * (1 - k), length)
+		p.Transparency = 0.1 + 0.9 * k
+	end)
+end
+
+function Fx.sparks(x, y, z, color, count)
+	local anchor = fxPart(Enum.PartType.Block, color, 1, Vector3.new(0.4, 0.4, 0.4))
+	anchor.Position = Vector3.new(x, y, z)
+	local emitter = UI.new("ParticleEmitter", {
+		Enabled = false,
+		Color = ColorSequence.new(color),
+		LightEmission = 1,
+		Lifetime = NumberRange.new(0.3, 0.7),
+		Speed = NumberRange.new(12, 30),
+		SpreadAngle = Vector2.new(180, 180),
+		Drag = 3,
+		Acceleration = Vector3.new(0, -40, 0),
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(1, 0) }),
+	}, anchor)
+	anchor.Parent = Fx.folder
+	emitter:Emit(count)
+	task.delay(1.2, function()
+		anchor:Destroy()
+	end)
+end
+
+function Fx.number(x, y, z, text, color, size)
+	local anchor = fxPart(Enum.PartType.Block, color, 1, Vector3.new(0.2, 0.2, 0.2))
+	anchor.Position = Vector3.new(x + (math.random() - 0.5) * 2, y + 2, z + (math.random() - 0.5) * 2)
+	local gui = UI.new("BillboardGui", {
+		Size = UDim2.new(0, 90, 0, 30),
+		AlwaysOnTop = true,
+		LightInfluence = 0,
+		MaxDistance = 400,
+	}, anchor)
+	local label = UI.new("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+		Font = BLACK,
+		TextSize = size,
+		TextColor3 = color,
+		TextStrokeTransparency = 0.2,
+		Text = text,
+	}, gui)
+	Fx.run(anchor, 0.7, function(_, k)
+		gui.StudsOffset = Vector3.new(0, k * 3, 0)
+		label.TextTransparency = k * k
+		label.TextStrokeTransparency = 0.2 + 0.8 * k
+	end)
+end
+
+-- how far something is from where the camera is looking, to decide if it should be heard or felt
+function Fx.distance(x, z)
+	local f = Cam.focus
+	return math.sqrt((x - f.X) ^ 2 + (z - f.Z) ^ 2)
+end
+
+function Fx.fighterPos(fid)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p:GetAttribute("FID") == fid then
+			local char = p.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if root then
+				return root.Position
+			end
+		end
+	end
+	for part, rec in pairs(BotView.recs) do
+		if part:GetAttribute("FID") == fid then
+			return rec.pos
+		end
+	end
+	return nil
+end
+
+function Fx.boltStart(id, x, z, dx, dz, speed, range, team, kind)
+	local size = kind == "pellet" and 0.9 or 1.3
+	local part = fxPart(Enum.PartType.Cylinder, teamColor(team), 0, Vector3.new(size * 2.8, size, size))
+	part.Parent = Fx.folder
+	Fx.bolts[id] = { part = part, x = x, z = z, dx = dx, dz = dz, speed = speed, left = range, late = 0 }
+end
+
+function Fx.boltEnd(id, x, z, how, team, splash)
+	local bolt = Fx.bolts[id]
+	if bolt then
+		bolt.part:Destroy()
+		Fx.bolts[id] = nil
+	end
+	local color = teamColor(team)
+	if how == 1 then
+		Fx.disc(x, z, 1, splash * 0.75, color, 0.3)
+	elseif how == 2 then
+		Fx.disc(x, z, 0.5, splash * 0.6, color, 0.25)
+	else
+		Fx.disc(x, z, splash * 0.3, splash, color, 0.32)
+	end
+	if Fx.distance(x, z) < 60 then
+		Sfx.play("splat")
+	end
+end
+
+function Fx.lob(x0, z0, x1, z1, flight, team)
+	local color = teamColor(team)
+	local ball = fxPart(Enum.PartType.Ball, color, 0, Vector3.new(2.4, 2.4, 2.4))
+	Fx.run(ball, flight, function(p, k)
+		p.Position = Vector3.new(x0 + (x1 - x0) * k, FLOOR + 3 + math.sin(k * math.pi) * 20, z0 + (z1 - z0) * k)
+	end)
+	Fx.disc(x1, z1, 11, 11, color, flight, nil, 0.8)
+end
+
+function Fx.burst(x, z, radius, team, kind)
+	local color = teamColor(team)
+	local close = Fx.distance(x, z)
+	if kind == "pickup" then
+		Fx.disc(x, z, 1, radius, C.white, 0.3)
+		Fx.sparks(x, FLOOR + 3, z, C.white, 10)
+		if close < 70 then
+			Sfx.play("ping")
+		end
+		return
+	end
+	Fx.disc(x, z, radius * 0.25, radius, color, 0.4)
+	Fx.orb(x, FLOOR + 2, z, radius * 0.2, radius * 0.7, color, 0.32)
+	Fx.sparks(x, FLOOR + 2, z, color, math.clamp(math.floor(radius), 6, 30))
+	if kind == "ult" then
+		Fx.disc(x, z, radius * 0.1, radius, C.white, 0.5, FLOOR + 0.8, 0.5, 0.08)
+		Fx.disc(x, z, radius * 0.1, radius * 0.8, color, 0.6, FLOOR + 0.9, 0.3, 0.16)
+		if close < 110 then
+			Fx.shake = math.max(Fx.shake, 2.2)
+			Sfx.play("ult")
+			Sfx.play("boom")
+		end
+	elseif kind == "ko" then
+		Fx.disc(x, z, 1, radius * 0.6, C.white, 0.3, FLOOR + 0.8, 0.4)
+		if close < 80 then
+			Fx.shake = math.max(Fx.shake, 1)
+			Sfx.play("boom")
+		end
+	elseif kind == "fall" or kind == "overdrive" then
+		if close < 60 then
+			Sfx.play("splat")
+		end
+	elseif close < 80 then
+		Fx.shake = math.max(Fx.shake, 0.5)
+		Sfx.play("boom")
+	end
+end
+
+function Fx.handle(kind, ...)
+	local a, b, c, d, e, f, g, h, i = ...
+	if kind == "bolt" then
+		Fx.boltStart(a, b, c, d, e, f, g, h, i)
+	elseif kind == "boltEnd" then
+		Fx.boltEnd(a, b, c, d, e, f)
+	elseif kind == "lob" then
+		Fx.lob(a, b, c, d, e, f)
+	elseif kind == "burst" then
+		Fx.burst(a, b, c, d, e)
+	elseif kind == "telegraph" then
+		-- a, b = position, c = radius, d = team, e = seconds until it goes off
+		Fx.disc(a, b, c, c, teamColor(d), e, nil, 0.8)
+		Fx.disc(a, b, 0.5, c, teamColor(d), e, FLOOR + 0.7, 0.55)
+		Fx.sparks(a, FLOOR + 3, b, teamColor(d), 16)
+	elseif kind == "charge" then
+		local pos = Fx.fighterPos(a)
+		if pos then
+			Fx.orb(pos.X, FLOOR + 3, pos.Z, 0.8, 3.6, teamColor(c), b)
+		end
+	elseif kind == "beam" then
+		Fx.line(a, b, c, d, 3.6, teamColor(e), 0.42)
+		Fx.line(a, b, c, d, 1.3, C.white, 0.26, FLOOR + 2.6)
+		Fx.sparks(c, FLOOR + 2.4, d, teamColor(e), 14)
+		if Fx.distance(a, b) < 90 then
+			Fx.shake = math.max(Fx.shake, 0.6)
+			Sfx.play("boom")
+		end
+	elseif kind == "dash" then
+		Fx.line(a, b, a + c * 16, b + d * 16, 1.8, teamColor(e), 0.3)
+	elseif kind == "hit" then
+		-- a, b, c = position, d = amount, e = attacker id, f = victim id
+		local mine = e == player:GetAttribute("FID")
+		local onMe = f == player:GetAttribute("FID")
+		Fx.sparks(a, b, c, C.white, 5)
+		if mine then
+			Fx.number(a, b, c, tostring(d), C.gold, 22)
+			Sfx.play("hit")
+		elseif onMe then
+			Fx.number(a, b, c, tostring(d), C.bad, 20)
+		else
+			Fx.number(a, b, c, tostring(d), C.muted, 13)
+		end
+	elseif kind == "block" then
+		Fx.disc(a, b, 2, 5.5, C.white, 0.25, FLOOR + 3, 0.3)
+	elseif kind == "heal" then
+		Fx.orb(a, FLOOR + 4, b, 0.6, 1.7, C.good, 0.5)
+	end
+end
+
+function Fx.update(dt)
+	local list = Fx.list
+	local i = 1
+	while i <= #list do
+		local a = list[i]
+		a.t = a.t + dt
+		local done = false
+		if a.t >= 0 then
+			if not a.on then
+				a.on = true
+				a.part.Parent = Fx.folder
+			end
+			local k = math.min(1, a.t / a.dur)
+			a.step(a.part, k)
+			done = k >= 1
+		end
+		if done then
+			a.part:Destroy()
+			list[i] = list[#list]
+			list[#list] = nil
+		else
+			i = i + 1
+		end
+	end
+	for id, bolt in pairs(Fx.bolts) do
+		local step = math.min(bolt.left, bolt.speed * dt)
+		bolt.x, bolt.z, bolt.left = bolt.x + bolt.dx * step, bolt.z + bolt.dz * step, bolt.left - step
+		local pos = Vector3.new(bolt.x, FLOOR + 2.6, bolt.z)
+		bolt.part.CFrame = CFrame.new(pos, pos + Vector3.new(bolt.dx, 0, bolt.dz)) * CFrame.Angles(0, math.rad(90), 0)
+		if bolt.left <= 0 then
+			-- the server normally says when a bolt ends; this is only a safety net
+			bolt.late = bolt.late + dt
+			if bolt.late > 0.4 then
+				bolt.part:Destroy()
+				Fx.bolts[id] = nil
+			end
+		end
+	end
+	Fx.shake = math.max(0, Fx.shake - dt * 4)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Bot bodies. The server moves an invisible ball; a smooth, livelier body is drawn here.
+---------------------------------------------------------------------------------------------------
+
+BotView.recs = {}
+BotView.bubbles = {}   -- [player] = shield bubble part
+BotView.folder = world:WaitForChild("Bots")
+
+local function bodyPiece(size, color, material)
+	return UI.new("Part", {
+		Shape = Enum.PartType.Ball,
+		Size = size,
+		Color = color,
+		Material = material,
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		CastShadow = false,
+		TopSurface = Enum.SurfaceType.Smooth,
+		BottomSurface = Enum.SurfaceType.Smooth,
+	}, Fx.folder)
+end
+
+function BotView.hook(part)
+	if not part:IsA("BasePart") or BotView.recs[part] then
+		return
+	end
+	local color = teamColor(part:GetAttribute("Team"))
+	local rec = {
+		part = part,
+		pos = part.Position,
+		face = Vector3.new(0, 0, -1),
+		phase = math.random() * 6,
+		body = bodyPiece(Vector3.new(3.6, 3.6, 3.6), color, NEON),
+		cap = bodyPiece(Vector3.new(1.5, 1.5, 1.5), C.white, NEON),
+		eyeL = bodyPiece(Vector3.new(0.8, 0.8, 0.8), C.ink, SMOOTH),
+		eyeR = bodyPiece(Vector3.new(0.8, 0.8, 0.8), C.ink, SMOOTH),
+		bubble = bodyPiece(Vector3.new(6.2, 6.2, 6.2), color, Enum.Material.ForceField),
+	}
+	part.LocalTransparencyModifier = 1
+	local plate = part:FindFirstChild("Plate")
+	if plate and plate:IsA("BillboardGui") then
+		plate.Adornee = rec.body
+	end
+	BotView.recs[part] = rec
+end
+
+function BotView.unhook(part)
+	local rec = BotView.recs[part]
+	if rec then
+		BotView.recs[part] = nil
+		rec.body:Destroy()
+		rec.cap:Destroy()
+		rec.eyeL:Destroy()
+		rec.eyeR:Destroy()
+		rec.bubble:Destroy()
+	end
+end
+
+function BotView.update(dt)
+	local t = serverNow()
+	local clock = os.clock()
+	for part, rec in pairs(BotView.recs) do
+		if not part.Parent then
+			BotView.unhook(part)
+		else
+			local shown = part:GetAttribute("Alive") == true
+			local delta = part.Position - rec.pos
+			if delta.Magnitude > 22 then
+				rec.pos = part.Position
+			else
+				rec.pos = rec.pos + delta * (1 - math.exp(-dt * 16))
+			end
+			local flat = Vector3.new(delta.X, 0, delta.Z)
+			if flat.Magnitude > 0.15 then
+				local turned = rec.face:Lerp(flat.Unit, math.min(1, dt * 10))
+				if turned.Magnitude > 0.05 then
+					rec.face = turned.Unit
+				end
+			end
+			local bob = math.sin(clock * 10 + rec.phase) * 0.22 * math.min(1, flat.Magnitude * 2)
+			local at = rec.pos + Vector3.new(0, bob, 0)
+			local cf = CFrame.new(at, at + rec.face)
+			local hidden = shown and 0 or 1
+			rec.body.CFrame = cf
+			rec.body.Transparency = hidden
+			rec.cap.CFrame = cf * CFrame.new(0, 1.5, 0)
+			rec.cap.Transparency = hidden
+			rec.eyeL.CFrame = cf * CFrame.new(-0.62, 0.35, -1.5)
+			rec.eyeL.Transparency = hidden
+			rec.eyeR.CFrame = cf * CFrame.new(0.62, 0.35, -1.5)
+			rec.eyeR.Transparency = hidden
+			local safe = shown and (t < (part:GetAttribute("ShieldT") or 0) or t < (part:GetAttribute("SafeT") or 0))
+			rec.bubble.CFrame = cf
+			rec.bubble.Transparency = safe and 0 or 1
+		end
+	end
+	-- shield bubbles around human players
+	for _, p in ipairs(Players:GetPlayers()) do
+		local char = p.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local on = root ~= nil and t < (p:GetAttribute("ShieldT") or 0)
+		local bubble = BotView.bubbles[p]
+		if on then
+			if not bubble then
+				bubble = bodyPiece(Vector3.new(8, 8, 8), teamColor(p:GetAttribute("Team")), Enum.Material.ForceField)
+				BotView.bubbles[p] = bubble
+			end
+			bubble.Position = root.Position
+			bubble.Transparency = 0
+		elseif bubble then
+			bubble.Transparency = 1
+		end
+	end
+end
+
+function BotView.init()
+	BotView.folder.ChildAdded:Connect(BotView.hook)
+	BotView.folder.ChildRemoved:Connect(BotView.unhook)
+	for _, part in ipairs(BotView.folder:GetChildren()) do
+		BotView.hook(part)
+	end
+	Players.PlayerRemoving:Connect(function(p)
+		local bubble = BotView.bubbles[p]
+		if bubble then
+			bubble:Destroy()
+			BotView.bubbles[p] = nil
+		end
+	end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Camera: fixed angle from above, so the painted floor is always in view
+---------------------------------------------------------------------------------------------------
+
+Cam.dist = 96
+Cam.focus = Vector3.new(0, FLOOR + 18, 0)
+Cam.eye = Vector3.new(0, FLOOR + 90, 46)
+Cam.target = nil
+
+function Cam.update(dt)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	if camera.CameraType ~= Enum.CameraType.Scriptable then
+		camera.CameraType = Enum.CameraType.Scriptable
+	end
+	local wantFocus, wantEye
+	if phase() == "Results" then
+		-- gallery view: the finished painting from straight above, slowly turning
+		local a = os.clock() * 0.12
+		wantFocus = Vector3.new(0, FLOOR, 0)
+		wantEye = Vector3.new(math.sin(a) * 40, FLOOR + 205, math.cos(a) * 40)
+	else
+		if alive() then
+			Cam.target = me.root.Position
+		end
+		local tgt = Cam.target or Vector3.new(0, FLOOR + 21, 0)
+		wantFocus = Vector3.new(tgt.X, math.max(FLOOR - 4, tgt.Y - 3), tgt.Z)
+		wantEye = wantFocus + Vector3.new(0, 0.848 * Cam.dist, 0.53 * Cam.dist)
+	end
+	local k = 1 - math.exp(-math.min(dt, 0.1) * 9)
+	Cam.focus = Cam.focus:Lerp(wantFocus, k)
+	Cam.eye = Cam.eye:Lerp(wantEye, k)
+	local eye, focus = Cam.eye, Cam.focus
+	if Fx.shake > 0.01 then
+		local jolt = Vector3.new((math.random() - 0.5) * Fx.shake, (math.random() - 0.5) * Fx.shake, 0)
+		eye, focus = eye + jolt, focus + jolt
+	end
+	camera.CFrame = CFrame.new(eye, focus)
+	camera.Focus = CFrame.new(focus)
+	camera.FieldOfView = 50
+end
+
+---------------------------------------------------------------------------------------------------
+-- Input: aiming and actions
+---------------------------------------------------------------------------------------------------
+
+Input.firing = false
+Input.cool = { primary = 0, dash = 0, a1 = 0, a2 = 0 }   -- os.clock() time when each is ready again
+
+function Input.device()
+	local last = UserInputService:GetLastInputType()
+	if last == Enum.UserInputType.Touch then
+		return "touch"
+	elseif last == Enum.UserInputType.Gamepad1 then
+		return "pad"
+	elseif UserInputService.MouseEnabled then
+		return "mouse"
+	end
+	return "touch"
+end
+
+-- positions of every living enemy
+function Input.enemies()
+	local list = {}
+	local team = myTeam()
+	for _, p in ipairs(Players:GetPlayers()) do
+		local theirs = p:GetAttribute("Team") or 0
+		if p ~= player and theirs > 0 and theirs ~= team then
+			local char = p.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 then
+				table.insert(list, root.Position)
+			end
+		end
+	end
+	for part in pairs(BotView.recs) do
+		if part:GetAttribute("Alive") == true and part:GetAttribute("Team") ~= team then
+			table.insert(list, part.Position)
+		end
+	end
+	return list
+end
+
+-- Where the player is aiming on the floor. With a mouse it is the cursor; on touch and gamepad
+-- it snaps to the nearest enemy, or straight ahead when nobody is close.
+function Input.aim()
+	local root = me.root
+	local pos = root.Position
+	local camera = workspace.CurrentCamera
+	if camera and Input.device() == "mouse" then
+		local m = UserInputService:GetMouseLocation()
+		local ray = camera:ViewportPointToRay(m.X, m.Y)
+		if ray.Direction.Y < -0.02 then
+			local hit = ray.Origin + ray.Direction * ((FLOOR + 0.3 - ray.Origin.Y) / ray.Direction.Y)
+			return hit.X, hit.Z
+		end
+	end
+	local best, bestD = nil, 82
+	for _, p in ipairs(Input.enemies()) do
+		local d = math.sqrt((p.X - pos.X) ^ 2 + (p.Z - pos.Z) ^ 2)
+		if d < bestD then
+			best, bestD = p, d
+		end
+	end
+	if best then
+		return best.X, best.Z
+	end
+	local look = root.CFrame.LookVector
+	return pos.X + look.X * 40, pos.Z + look.Z * 40
+end
+
+function Input.dash(root, dir)
+	local attachment = UI.new("Attachment", {}, root)
+	local mover = UI.new("LinearVelocity", {
+		Attachment0 = attachment,
+		MaxForce = 1e7,
+		VectorVelocity = dir * 95,
+		RelativeTo = Enum.ActuatorRelativeTo.World,
+	}, root)
+	task.delay(0.17, function()
+		mover:Destroy()
+		attachment:Destroy()
+		if root.Parent then
+			root.AssemblyLinearVelocity = dir * CONFIG.walk
+		end
+	end)
+end
+
+function Input.act(action)
+	if phase() ~= "Playing" or myTeam() == 0 or not alive() then
+		return
+	end
+	local t = os.clock()
+	if action == "ult" then
+		if (player:GetAttribute("Ult") or 0) < 100 then
+			return
+		end
+	elseif t < Input.cool[action] then
+		return
+	end
+	local root = me.root
+	local ax, az = Input.aim()
+	if action == "primary" then
+		local id = player:GetAttribute("Primary") or "bolt"
+		local def = CONFIG.primaries[id] or CONFIG.primaries.bolt
+		Input.cool.primary = t + def.cd
+		Sfx.play(id == "scatter" and "pellets" or (id == "lob" and "lob" or "fire"))
+	elseif action == "dash" then
+		local move = me.hum.MoveDirection
+		local dir = Vector3.new(move.X, 0, move.Z)
+		if dir.Magnitude < 0.1 then
+			dir = Vector3.new(ax - root.Position.X, 0, az - root.Position.Z)
+		end
+		if dir.Magnitude < 0.1 then
+			return
+		end
+		dir = dir.Unit
+		Input.cool.dash = t + CONFIG.dash.cd
+		Input.dash(root, dir)
+		ax, az = root.Position.X + dir.X * 10, root.Position.Z + dir.Z * 10
+		Sfx.play("dash")
+	elseif action == "a1" or action == "a2" then
+		local id = player:GetAttribute(action == "a1" and "A1" or "A2")
+		local def = CONFIG.abilities[id]
+		if not def then
+			return
+		end
+		Input.cool[action] = t + def.cd
+		Sfx.play("cast")
+	else
+		Sfx.play("cast")
+	end
+	actEvent:FireServer(action, ax, az)
+end
+
+function Input.update()
+	if Input.firing then
+		Input.act("primary")
+	end
+end
+
+function Input.init()
+	local K = Enum.KeyCode
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		local key = input.KeyCode
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or key == K.ButtonR2 then
+			Input.firing = true
+		elseif key == K.Q or key == K.LeftShift or key == K.ButtonL2 then
+			Input.act("dash")
+		elseif key == K.E or key == K.ButtonX then
+			Input.act("a1")
+		elseif key == K.R or key == K.ButtonY then
+			Input.act("a2")
+		elseif key == K.F or key == K.ButtonR1 then
+			Input.act("ult")
+		elseif key == K.M then
+			Menu.toggle()
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == K.ButtonR2 then
+			Input.firing = false
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input, processed)
+		if not processed and input.UserInputType == Enum.UserInputType.MouseWheel then
+			Cam.dist = math.clamp(Cam.dist - input.Position.Z * 7, 60, 128)
+		end
+	end)
+	hurtEvent.OnClientEvent:Connect(function(kx, kup, kz, amount)
+		if type(kx) ~= "number" or type(kup) ~= "number" or type(kz) ~= "number" then
+			return
+		end
+		if alive() and (math.abs(kx) + math.abs(kz) + kup) > 1 then
+			local v = me.root.AssemblyLinearVelocity
+			me.root.AssemblyLinearVelocity = Vector3.new(kx, math.max(v.Y, kup), kz)
+		end
+		Hud.flash = 1
+		Fx.shake = math.max(Fx.shake, 0.6)
+		Sfx.play("hurt")
+	end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- HUD
+---------------------------------------------------------------------------------------------------
+
+Hud.flash = 0
+Hud.phase = nil
+Hud.lastCount = nil
+Hud.fa, Hud.fb = 0, 0
+Hud.feed = {}
+Hud.slots = {}
+Hud.ann = { t = 99, hold = 1 }
+
+local SLOT_KEYS = { primary = "LMB", dash = "SHIFT", a1 = "E", a2 = "R", ult = "F" }
+
+-- One ability button. Used both for the bar at the bottom and for the touch buttons.
+function Hud.slot(parent, action, size, props, touch)
+	props.Size = UDim2.new(0, size, 0, size)
+	props.AutoButtonColor = false
+	props.Text = ""
+	props.BorderSizePixel = 0
+	props.BackgroundColor3 = C.ink
+	props.BackgroundTransparency = touch and 0.3 or 0.14
+	local button = UI.new("TextButton", props, parent)
+	if touch then
+		UI.round(button)
+	else
+		UI.corner(button, 16)
+	end
+	local border = UI.stroke(button)
+	local fill = UI.frame(button, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, 0),
+		BackgroundColor3 = C.gold, BackgroundTransparency = 0.72,
+	})
+	if touch then
+		UI.round(fill)
+	else
+		UI.corner(fill, 16)
+	end
+	local icon = UI.frame(button, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, touch and 0.5 or 0.42, 0),
+		Size = UDim2.new(0.46, 0, 0.46, 0),
+	})
+	local name = UI.label(button, "", 9, BOLD, C.muted, {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -5), Size = UDim2.new(1, -4, 0, 11),
+		TextXAlignment = CENTER, Visible = not touch,
+	})
+	local shade = UI.frame(button, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, 0),
+		BackgroundColor3 = Color3.fromRGB(0, 0, 0), BackgroundTransparency = 0.45,
+	})
+	if touch then
+		UI.round(shade)
+	else
+		UI.corner(shade, 16)
+	end
+	local count = UI.label(button, "", touch and 20 or 22, BLACK, C.text, {
+		Size = UDim2.new(1, 0, 1, 0), TextXAlignment = CENTER, TextStrokeTransparency = 0.5,
+	})
+	if not touch then
+		local chip = UI.frame(button, {
+			Position = UDim2.new(0, -6, 0, -8), Size = UDim2.new(0, #SLOT_KEYS[action] * 7 + 12, 0, 18),
+			BackgroundColor3 = C.card, BackgroundTransparency = 0,
+		})
+		UI.round(chip)
+		UI.stroke(chip)
+		UI.label(chip, SLOT_KEYS[action], 10, BOLD, C.text, { Size = UDim2.new(1, 0, 1, 0), TextXAlignment = CENTER })
+	end
+	local slot = { action = action, button = button, border = border, fill = fill, icon = icon, name = name,
+		shade = shade, count = count, kind = nil }
+	table.insert(Hud.slots, slot)
+	if action == "primary" then
+		button.InputBegan:Connect(function(input)
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.Touch or kind == Enum.UserInputType.MouseButton1 then
+				Input.firing = true
+			end
+		end)
+		button.InputEnded:Connect(function(input)
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.Touch or kind == Enum.UserInputType.MouseButton1 then
+				Input.firing = false
+			end
+		end)
+	else
+		button.Activated:Connect(function()
+			Input.act(action)
+		end)
+	end
+	return slot
+end
+
+function Hud.build()
+	local gui = UI.new("ScreenGui", {
+		Name = "NeonCanvasHud", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 5,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	Hud.gui = gui
+	Hud.scale = UI.new("UIScale", { Scale = 1 }, gui)
+
+	-- hurt flash sits behind everything else
+	Hud.flashFrame = UI.frame(gui, {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.bad, BackgroundTransparency = 1, Active = false,
+	})
+
+	-- scoreboard, top centre
+	local board = UI.panel(gui, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), Size = UDim2.new(0, 540, 0, 78),
+	})
+	Hud.nameA = UI.label(board, "", 12, BOLD, teamColor(1), { Position = UDim2.new(0, 20, 0, 9), Size = UDim2.new(0, 180, 0, 14) })
+	Hud.scoreA = UI.label(board, "0", 28, BLACK, C.text, { Position = UDim2.new(0, 20, 0, 23), Size = UDim2.new(0, 180, 0, 32) })
+	Hud.nameB = UI.label(board, "", 12, BOLD, teamColor(2), {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 9), Size = UDim2.new(0, 180, 0, 14),
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	Hud.scoreB = UI.label(board, "0", 28, BLACK, C.text, {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 23), Size = UDim2.new(0, 180, 0, 32),
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	Hud.chip = UI.frame(board, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 9), Size = UDim2.new(0, 104, 0, 36),
+		BackgroundColor3 = C.card,
+	})
+	UI.corner(Hud.chip, 12)
+	Hud.timer = UI.label(Hud.chip, "0:00", 22, BLACK, C.text, { Size = UDim2.new(1, 0, 1, 0), TextXAlignment = CENTER })
+	Hud.modeText = UI.label(board, "", 10, BOLD, C.muted, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 47), Size = UDim2.new(0, 200, 0, 12),
+		TextXAlignment = CENTER,
+	})
+	local track = UI.frame(board, {
+		Position = UDim2.new(0, 20, 0, 63), Size = UDim2.new(1, -40, 0, 6), BackgroundColor3 = C.card,
+	})
+	UI.round(track)
+	Hud.fillA = UI.frame(track, { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = teamColor(1) })
+	UI.round(Hud.fillA)
+	Hud.fillB = UI.frame(track, {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = teamColor(2),
+	})
+	UI.round(Hud.fillB)
+	Hud.goal = UI.label(gui, "", 13, MEDIUM, C.text, {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 94), Size = UDim2.new(0, 520, 0, 20),
+		TextXAlignment = CENTER, TextStrokeTransparency = 0.55,
+	})
+
+	-- announcements, upper middle
+	Hud.annTitle = UI.label(gui, "", 46, BLACK, C.text, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.27, 0), Size = UDim2.new(1, 0, 0, 56),
+		TextXAlignment = CENTER, TextTransparency = 1, TextStrokeTransparency = 1,
+	})
+	Hud.annSub = UI.label(gui, "", 18, MEDIUM, C.text, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.27, 40), Size = UDim2.new(1, 0, 0, 24),
+		TextXAlignment = CENTER, TextTransparency = 1, TextStrokeTransparency = 1,
+	})
+
+	-- knock-out feed, top right
+	Hud.feedBox = UI.frame(gui, {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 56), Size = UDim2.new(0, 340, 0, 200),
+	})
+	UI.new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical, HorizontalAlignment = Enum.HorizontalAlignment.Right,
+		VerticalAlignment = Enum.VerticalAlignment.Top, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+	}, Hud.feedBox)
+
+	local menuButton = UI.button(gui, "MENU  [M]", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 12), Size = UDim2.new(0, 104, 0, 34),
+		BackgroundColor3 = C.ink, BackgroundTransparency = 0.14,
+	})
+	menuButton.Activated:Connect(function()
+		Menu.toggle()
+	end)
+
+	-- player card, bottom left
+	local card = UI.panel(gui, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -18), Size = UDim2.new(0, 262, 0, 70),
+	})
+	Hud.card = card
+	UI.label(card, player.DisplayName, 14, BOLD, C.text, {
+		Position = UDim2.new(0, 16, 0, 9), Size = UDim2.new(1, -96, 0, 18), TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	local lvl = UI.frame(card, {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 9), Size = UDim2.new(0, 58, 0, 18),
+		BackgroundColor3 = C.card,
+	})
+	UI.round(lvl)
+	Hud.lvl = UI.label(lvl, "LV 1", 10, BOLD, C.gold, { Size = UDim2.new(1, 0, 1, 0), TextXAlignment = CENTER })
+	local hpTrack = UI.frame(card, { Position = UDim2.new(0, 16, 0, 33), Size = UDim2.new(1, -32, 0, 14), BackgroundColor3 = C.card })
+	UI.round(hpTrack)
+	Hud.hpFill = UI.frame(hpTrack, { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.good })
+	UI.round(Hud.hpFill)
+	Hud.hpText = UI.label(hpTrack, "100", 10, BOLD, C.text, {
+		Size = UDim2.new(1, 0, 1, 0), TextXAlignment = CENTER, TextStrokeTransparency = 0.6,
+	})
+	local xpTrack = UI.frame(card, { Position = UDim2.new(0, 16, 0, 54), Size = UDim2.new(1, -32, 0, 4), BackgroundColor3 = C.card })
+	UI.round(xpTrack)
+	Hud.xpFill = UI.frame(xpTrack, { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = C.gold })
+	UI.round(Hud.xpFill)
+	Hud.buffs = UI.label(gui, "", 12, BOLD, C.gold, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 20, 1, -94), Size = UDim2.new(0, 400, 0, 16),
+		TextStrokeTransparency = 0.5,
+	})
+
+	-- ability bar, bottom centre (keyboard and gamepad)
+	Hud.bar = UI.frame(gui, {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -22), Size = UDim2.new(0, 390, 0, 70),
+	})
+	local order = { "primary", "dash", "a1", "a2", "ult" }
+	for i, action in ipairs(order) do
+		Hud.slot(Hud.bar, action, 70, { Position = UDim2.new(0, (i - 1) * 80, 0, 0) }, false)
+	end
+
+	-- knocked-out notice
+	Hud.down = UI.panel(gui, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.62, 0), Size = UDim2.new(0, 320, 0, 76),
+		Visible = false,
+	})
+	UI.label(Hud.down, "KNOCKED OUT", 20, BLACK, C.bad, { Position = UDim2.new(0, 0, 0, 12), Size = UDim2.new(1, 0, 0, 24), TextXAlignment = CENTER })
+	Hud.downText = UI.label(Hud.down, "", 13, MEDIUM, C.text, { Position = UDim2.new(0, 0, 0, 42), Size = UDim2.new(1, 0, 0, 18), TextXAlignment = CENTER })
+
+	-- Touch buttons sit in their own layer, finger sized, hugging Roblox's jump button
+	-- (bottom right: 70 px on phones, 120 px on tablets).
+	if UserInputService.TouchEnabled then
+		local touch = UI.new("ScreenGui", {
+			Name = "NeonCanvasTouch", ResetOnSpawn = false, DisplayOrder = 6, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		}, playerGui)
+		Hud.touch = touch
+		Hud.touchScale = UI.new("UIScale", { Scale = 1 }, touch)
+		local a = Vector2.new(1, 1)
+		Hud.slot(touch, "primary", 84, { AnchorPoint = a, Position = UDim2.new(1, -110, 1, -18) }, true)
+		Hud.slot(touch, "dash", 58, { AnchorPoint = a, Position = UDim2.new(1, -206, 1, -24) }, true)
+		Hud.slot(touch, "a1", 56, { AnchorPoint = a, Position = UDim2.new(1, -178, 1, -112) }, true)
+		Hud.slot(touch, "a2", 56, { AnchorPoint = a, Position = UDim2.new(1, -108, 1, -118) }, true)
+		Hud.slot(touch, "ult", 56, { AnchorPoint = a, Position = UDim2.new(1, -32, 1, -106) }, true)
+		-- the thumbstick lives bottom left, so the player card moves up out of its way
+		Hud.card.AnchorPoint = Vector2.new(0, 0)
+		Hud.card.Position = UDim2.new(0, 16, 0, 60)
+		Hud.buffs.AnchorPoint = Vector2.new(0, 0)
+		Hud.buffs.Position = UDim2.new(0, 20, 0, 136)
+	end
+end
+
+function Hud.announce(title, sub, hold, color)
+	Hud.annTitle.Text = title
+	Hud.annSub.Text = sub or ""
+	Hud.annTitle.TextColor3 = color or C.text
+	Hud.ann.t = 0
+	Hud.ann.hold = hold or 1.6
+end
+
+function Hud.addFeed(richText)
+	local row = UI.frame(Hud.feedBox, {
+		Size = UDim2.new(0, 320, 0, 26), BackgroundColor3 = C.ink, BackgroundTransparency = 0.2,
+		LayoutOrder = #Hud.feed + math.floor(os.clock() * 10),
+	})
+	UI.round(row)
+	local label = UI.label(row, richText, 12, MEDIUM, C.text, {
+		Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -24, 1, 0), RichText = true,
+		TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	table.insert(Hud.feed, { row = row, label = label, t = 0 })
+	if #Hud.feed > 5 then
+		Hud.feed[1].row:Destroy()
+		table.remove(Hud.feed, 1)
+	end
+end
+
+local function named(name, team)
+	return '<font color="' .. hex(teamColor(team)) .. '"><b>' .. escape(tostring(name)) .. "</b></font>"
+end
+
+function Hud.onFeed(kind, a, b, c, d, e, f)
+	if kind == "ko" then
+		-- a, b = killer name and team; c, d = victim name and team; e, f = their ids
+		Hud.addFeed(named(a, b) .. "  knocked out  " .. named(c, d))
+		local mine = player:GetAttribute("FID")
+		if e == mine then
+			Hud.announce("KNOCK-OUT", tostring(c) .. " is down", 1.1, C.gold)
+			Sfx.play("go")
+		elseif f == mine then
+			me.killer = tostring(a)
+		end
+	elseif kind == "fell" then
+		Hud.addFeed(named(a, b) .. "  fell off the canvas")
+		if c == player:GetAttribute("FID") then
+			me.killer = nil
+		end
+	elseif kind == "streak" then
+		Hud.addFeed(named(a, b) .. "  is on a " .. tostring(c) .. " knock-out streak")
+	elseif kind == "ult" then
+		Hud.addFeed(named(a, b) .. "  unleashed " .. CONFIG.ult.name)
+	elseif kind == "pickup" then
+		Hud.addFeed(named(a, b) .. "  grabbed " .. string.upper(tostring(c)))
+	elseif kind == "start" then
+		local mode = CONFIG.modes[a]
+		Hud.announce("PAINT!", mode and mode.goal or "", 1.8, C.gold)
+		Sfx.play("go")
+	elseif kind == "rush" then
+		Hud.announce("FINAL RUSH", "Everything counts double", 2.2, C.gold)
+		Sfx.play("go")
+	end
+end
+
+function Hud.refreshLoadout()
+	local ids = {
+		primary = player:GetAttribute("Primary") or "bolt",
+		dash = "dash",
+		a1 = player:GetAttribute("A1") or "nova",
+		a2 = player:GetAttribute("A2") or "shield",
+		ult = "ult",
+	}
+	for _, slot in ipairs(Hud.slots) do
+		local id = ids[slot.action]
+		if slot.kind ~= id then
+			slot.kind = id
+			local def = CONFIG.primaries[id] or CONFIG.abilities[id]
+			if slot.action ~= "ult" then
+				slot.name.Text = string.upper(def and def.name or CONFIG.dash.name)
+			end
+			UI.icon(slot.icon, id, slot.action == "ult" and C.gold or C.text)
+		end
+	end
+end
+
+function Hud.onPhase(now, before)
+	if now == "Intermission" or now == "Boot" then
+		Tiles.setShow(true)
+		Results.hide()
+		if not Menu.seen then
+			Menu.seen = true
+			Menu.open()
+		end
+	else
+		Tiles.setShow(false)
+	end
+	if now == "Countdown" then
+		Menu.close()
+		Results.hide()
+		Input.cool = { primary = 0, dash = 0, a1 = 0, a2 = 0 }
+		Hud.lastCount = nil
+	elseif now == "Results" then
+		Input.firing = false
+	end
+	if before == "Results" then
+		Results.hide()
+	end
+end
+
+function Hud.update(dt)
+	local ph = phase()
+	if ph ~= Hud.phase then
+		local before = Hud.phase
+		Hud.phase = ph
+		Hud.onPhase(ph, before)
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		local size = camera.ViewportSize
+		Hud.scale.Scale = math.clamp(size.Y / 760, 0.62, 1.3)
+		if Hud.touchScale then
+			Hud.touchScale.Scale = math.min(size.X, size.Y) > 500 and 1.6 or 1
+		end
+	end
+
+	local team = myTeam()
+	local mode = shared:GetAttribute("Mode") or "Turf"
+	local modeDef = CONFIG.modes[mode] or CONFIG.modes.Turf
+	local left = math.max(0, (shared:GetAttribute("EndsAt") or 0) - serverNow())
+	local rush = shared:GetAttribute("Rush") == true and ph == "Playing"
+	Hud.timer.Text = string.format("%d:%02d", math.floor(left / 60), math.floor(left % 60))
+	Hud.timer.TextColor3 = rush and C.gold or C.text
+	Hud.modeText.Text = modeDef.name
+	Hud.nameA.Text = CONFIG.teamNames[1] .. (team == 1 and "  ·  YOU" or "")
+	Hud.nameB.Text = (team == 2 and "YOU  ·  " or "") .. CONFIG.teamNames[2]
+
+	-- scores
+	local a, b = shared:GetAttribute("ScoreA") or 0, shared:GetAttribute("ScoreB") or 0
+	local wantA, wantB = 0, 0
+	if ph == "Intermission" or ph == "Boot" then
+		Hud.scoreA.Text, Hud.scoreB.Text = "-", "-"
+		Hud.goal.Text = "NEXT UP  ·  " .. modeDef.name .. "  on  " .. tostring(shared:GetAttribute("MapName") or "")
+		Hud.goal.TextColor3 = C.text
+	else
+		if mode == "Turf" then
+			local total = math.max(1, shared:GetAttribute("Total") or 1)
+			wantA, wantB = a / total, b / total
+			Hud.scoreA.Text = tostring(math.floor(wantA * 100 + 0.5)) .. "%"
+			Hud.scoreB.Text = tostring(math.floor(wantB * 100 + 0.5)) .. "%"
+		else
+			local goal = math.max(1, shared:GetAttribute("Goal") or 1)
+			wantA, wantB = math.min(1, a / goal) * 0.5, math.min(1, b / goal) * 0.5
+			Hud.scoreA.Text, Hud.scoreB.Text = tostring(a), tostring(b)
+		end
+		if rush then
+			Hud.goal.Text = "FINAL RUSH  ·  everything counts double"
+			Hud.goal.TextColor3 = C.gold
+		elseif ph == "Results" then
+			Hud.goal.Text = "MATCH OVER"
+			Hud.goal.TextColor3 = C.text
+		else
+			Hud.goal.Text = modeDef.goal .. "  ·  " .. tostring(shared:GetAttribute("MapName") or "")
+			Hud.goal.TextColor3 = C.text
+		end
+	end
+	local ease = 1 - math.exp(-dt * 8)
+	Hud.fa = Hud.fa + (wantA - Hud.fa) * ease
+	Hud.fb = Hud.fb + (wantB - Hud.fb) * ease
+	Hud.fillA.Size = UDim2.new(Hud.fa, 0, 1, 0)
+	Hud.fillB.Size = UDim2.new(Hud.fb, 0, 1, 0)
+
+	-- countdown numbers
+	if ph == "Countdown" then
+		local n = math.ceil(left)
+		if n ~= Hud.lastCount and n >= 1 and n <= 3 then
+			Hud.lastCount = n
+			Hud.announce(tostring(n), team > 0 and ("You are on " .. CONFIG.teamNames[team]) or "", 0.8, teamColor(team))
+			Sfx.play("tick")
+		end
+	end
+
+	-- announcement fade
+	local ann = Hud.ann
+	if ann.t < ann.hold + 0.4 then
+		ann.t = ann.t + dt
+		local alpha
+		if ann.t < 0.12 then
+			alpha = 1 - ann.t / 0.12
+		elseif ann.t < ann.hold then
+			alpha = 0
+		else
+			alpha = math.min(1, (ann.t - ann.hold) / 0.4)
+		end
+		Hud.annTitle.TextTransparency = alpha
+		Hud.annTitle.TextStrokeTransparency = 0.4 + 0.6 * alpha
+		Hud.annSub.TextTransparency = alpha
+		Hud.annSub.TextStrokeTransparency = 0.5 + 0.5 * alpha
+	end
+
+	-- feed fade
+	local i = 1
+	while i <= #Hud.feed do
+		local entry = Hud.feed[i]
+		entry.t = entry.t + dt
+		if entry.t > 5.5 then
+			entry.row:Destroy()
+			table.remove(Hud.feed, i)
+		else
+			local fade = math.clamp((entry.t - 4.7) / 0.8, 0, 1)
+			entry.row.BackgroundTransparency = 0.2 + 0.8 * fade
+			entry.label.TextTransparency = fade
+			i = i + 1
+		end
+	end
+
+	-- hurt flash
+	if Hud.flash > 0 then
+		Hud.flash = math.max(0, Hud.flash - dt * 3)
+	end
+	Hud.flashFrame.BackgroundTransparency = 1 - 0.3 * Hud.flash
+
+	-- player card
+	local hp, maxHp = 0, 100
+	if alive() then
+		hp, maxHp = me.hum.Health, math.max(1, me.hum.MaxHealth)
+	end
+	Hud.hpFill.Size = UDim2.new(math.clamp(hp / maxHp, 0, 1), 0, 1, 0)
+	Hud.hpFill.BackgroundColor3 = hp / maxHp > 0.35 and C.good or C.bad
+	Hud.hpText.Text = tostring(math.floor(hp + 0.5))
+	Hud.lvl.Text = "LV " .. tostring(player:GetAttribute("Lvl") or 1)
+	Hud.xpFill.Size = UDim2.new(math.clamp((player:GetAttribute("XP") or 0) / math.max(1, player:GetAttribute("XPNeed") or 1), 0, 1), 0, 1, 0)
+	local t = serverNow()
+	local buffs = {}
+	for _, pair in ipairs({ { "ShieldT", "SHIELD" }, { "SurgeT", "SURGE" }, { "HasteT", "HASTE" }, { "OverT", "OVERDRIVE" } }) do
+		local untilT = player:GetAttribute(pair[1]) or 0
+		if untilT > t then
+			table.insert(buffs, pair[2] .. " " .. tostring(math.ceil(untilT - t)) .. "s")
+		end
+	end
+	Hud.buffs.Text = table.concat(buffs, "   ")
+
+	-- ability buttons
+	local inMatch = team > 0 and (ph == "Countdown" or ph == "Playing")
+	Hud.bar.Visible = inMatch and Input.device() ~= "touch"
+	if Hud.touch then
+		Hud.touch.Enabled = inMatch and Input.device() == "touch"
+	end
+	Hud.refreshLoadout()
+	local clock = os.clock()
+	local ult = player:GetAttribute("Ult") or 0
+	for _, slot in ipairs(Hud.slots) do
+		if slot.action == "ult" then
+			slot.fill.Size = UDim2.new(1, 0, math.clamp(ult / 100, 0, 1), 0)
+			slot.name.Visible = true
+			if ult >= 100 then
+				slot.name.Text = "READY"
+				slot.name.TextColor3 = C.gold
+				slot.border.Color = C.gold
+				slot.border.Transparency = 0.2 + 0.4 * math.abs(math.sin(clock * 5))
+				slot.border.Thickness = 2
+			else
+				slot.name.Text = tostring(math.floor(ult)) .. "%"
+				slot.name.TextColor3 = C.muted
+				slot.border.Color = C.white
+				slot.border.Transparency = 0.86
+				slot.border.Thickness = 1
+			end
+		else
+			local total = 1
+			if slot.action == "dash" then
+				total = CONFIG.dash.cd
+			else
+				local def = CONFIG.primaries[slot.kind] or CONFIG.abilities[slot.kind]
+				total = def and def.cd or 1
+			end
+			local remaining = math.max(0, Input.cool[slot.action] - clock)
+			slot.shade.Size = UDim2.new(1, 0, math.clamp(remaining / total, 0, 1), 0)
+			slot.count.Text = remaining > 0.5 and tostring(math.ceil(remaining)) or ""
+		end
+	end
+
+	-- knocked-out notice
+	local down = inMatch and ph == "Playing" and not alive()
+	Hud.down.Visible = down
+	if down then
+		local back = math.max(0, math.ceil(CONFIG.respawn - (os.clock() - me.diedAt)))
+		Hud.downText.Text = (me.killer and ("by " .. me.killer .. "  ·  ") or "") .. "back in " .. tostring(back) .. "s"
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Menu: how to play, loadout, profile
+---------------------------------------------------------------------------------------------------
+
+Menu.seen = false
+Menu.tab = "play"
+Menu.cards = {}
+Menu.nextSlot = "a1"
+Menu.dirty = true
+
+local function rankOf(rating)
+	local current, nextRank = CONFIG.ranks[1], nil
+	for i, rank in ipairs(CONFIG.ranks) do
+		if rating >= rank.at then
+			current = rank
+			nextRank = CONFIG.ranks[i + 1]
+		end
+	end
+	return current, nextRank
+end
+
+-- One selectable card for a primary or an ability.
+function Menu.card(parent, slotKind, id, def, order)
+	local button = UI.new("TextButton", {
+		AutoButtonColor = false, Text = "", BorderSizePixel = 0, BackgroundColor3 = C.card, LayoutOrder = order,
+		Size = UDim2.new(0, 166, 0, 84),
+	}, parent)
+	UI.corner(button, 14)
+	local border = UI.stroke(button, C.white, 2, 1)
+	local icon = UI.frame(button, { Position = UDim2.new(0, 12, 0, 12), Size = UDim2.new(0, 30, 0, 30) })
+	UI.icon(icon, id, C.text)
+	UI.label(button, def.name, 14, BOLD, C.text, { Position = UDim2.new(0, 52, 0, 10), Size = UDim2.new(1, -86, 0, 18) })
+	UI.label(button, tostring(def.cd) .. "s", 10, BOLD, C.muted, { Position = UDim2.new(0, 52, 0, 28), Size = UDim2.new(1, -60, 0, 12) })
+	UI.label(button, def.desc, 10, MEDIUM, C.muted, {
+		Position = UDim2.new(0, 12, 0, 46), Size = UDim2.new(1, -24, 0, 32), TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	})
+	local tag = UI.label(button, "", 10, BLACK, C.gold, {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 10), Size = UDim2.new(0, 34, 0, 14),
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	local lock = UI.frame(button, {
+		Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(20, 22, 40), BackgroundTransparency = 0.06, Visible = false,
+	})
+	UI.corner(lock, 14)
+	UI.label(lock, def.name, 13, BOLD, C.muted, { Position = UDim2.new(0, 0, 0.5, -19), Size = UDim2.new(1, 0, 0, 18), TextXAlignment = CENTER })
+	UI.label(lock, "UNLOCKS AT LEVEL " .. tostring(def.unlock), 10, BLACK, C.gold, {
+		Position = UDim2.new(0, 0, 0.5, 2), Size = UDim2.new(1, 0, 0, 14), TextXAlignment = CENTER,
+	})
+	table.insert(Menu.cards, { slotKind = slotKind, id = id, def = def, border = border, tag = tag, lock = lock })
+	button.Activated:Connect(function()
+		Sfx.play("click")
+		if (player:GetAttribute("Lvl") or 1) < def.unlock then
+			return
+		end
+		if slotKind == "primary" then
+			requestEvent:FireServer("loadout", "primary", id)
+		elseif player:GetAttribute("A1") ~= id and player:GetAttribute("A2") ~= id then
+			requestEvent:FireServer("loadout", Menu.nextSlot, id)
+			Menu.nextSlot = Menu.nextSlot == "a1" and "a2" or "a1"
+		end
+	end)
+end
+
+function Menu.build()
+	local gui = UI.new("ScreenGui", {
+		Name = "NeonCanvasMenu", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 8, Enabled = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	Menu.gui = gui
+	Menu.scale = UI.new("UIScale", { Scale = 1 }, gui)
+	-- Active makes the backdrop swallow clicks, so choosing a card never fires a shot
+	UI.frame(gui, { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.ink, BackgroundTransparency = 0.45, Active = true })
+	local panel = UI.panel(gui, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 760, 0, 470),
+		BackgroundTransparency = 0.04,
+	}, 24)
+
+	-- left column: title and tabs
+	local side = UI.frame(panel, { Size = UDim2.new(0, 190, 1, 0), BackgroundColor3 = C.card, BackgroundTransparency = 0.5 })
+	UI.corner(side, 24)
+	UI.label(side, "NEON", 30, BLACK, teamColor(1), { Position = UDim2.new(0, 22, 0, 22), Size = UDim2.new(1, -30, 0, 32) })
+	UI.label(side, "CANVAS", 30, BLACK, teamColor(2), { Position = UDim2.new(0, 22, 0, 52), Size = UDim2.new(1, -30, 0, 32) })
+	UI.label(side, "Paint the floor. Knock out the rest.", 11, MEDIUM, C.muted, {
+		Position = UDim2.new(0, 22, 0, 90), Size = UDim2.new(1, -36, 0, 30), TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	})
+	Menu.tabs = {}
+	Menu.pages = {}
+	local names = { { "play", "HOW TO PLAY" }, { "loadout", "LOADOUT" }, { "profile", "PROFILE" } }
+	for i, pair in ipairs(names) do
+		local tab = UI.button(side, pair[2], {
+			Position = UDim2.new(0, 18, 0, 130 + (i - 1) * 44), Size = UDim2.new(1, -36, 0, 36),
+		})
+		Menu.tabs[pair[1]] = tab
+		tab.Activated:Connect(function()
+			Menu.show(pair[1])
+		end)
+		Menu.pages[pair[1]] = UI.frame(panel, {
+			Position = UDim2.new(0, 214, 0, 24), Size = UDim2.new(1, -238, 1, -48), Visible = false,
+		})
+	end
+	Menu.status = UI.label(side, "", 11, MEDIUM, C.muted, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 22, 1, -64), Size = UDim2.new(1, -36, 0, 30),
+		TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+	})
+	local close = UI.button(side, "CLOSE", {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 18, 1, -18), Size = UDim2.new(1, -36, 0, 36),
+	}, C.gold)
+	close.Activated:Connect(function()
+		Menu.close()
+	end)
+
+	-- how to play
+	local play = Menu.pages.play
+	UI.label(play, "HOW TO PLAY", 20, BLACK, C.text, { Size = UDim2.new(1, 0, 0, 26) })
+	local lines = {
+		{ "nova", "Every dot you walk over or splash turns your team's colour." },
+		{ "bolt", "Shoot enemies to knock them out. Each knock-out repaints the floor around them." },
+		{ "dash", "Dash to dodge. Falling off the canvas counts as a knock-out." },
+		{ "ult", "Painting and fighting charge your Chroma Burst. Use it to flip a fight." },
+		{ "overdrive", "Glowing orbs on the floor are power-ups. Grab them first." },
+	}
+	for i, line in ipairs(lines) do
+		local row = UI.frame(play, { Position = UDim2.new(0, 0, 0, 40 + (i - 1) * 44), Size = UDim2.new(1, 0, 0, 38) })
+		local icon = UI.frame(row, { Position = UDim2.new(0, 4, 0, 5), Size = UDim2.new(0, 26, 0, 26) })
+		UI.icon(icon, line[1], i % 2 == 1 and teamColor(1) or teamColor(2))
+		UI.label(row, line[2], 13, MEDIUM, C.text, {
+			Position = UDim2.new(0, 46, 0, 0), Size = UDim2.new(1, -50, 1, 0), TextWrapped = true,
+		})
+	end
+	local keys = UI.frame(play, { Position = UDim2.new(0, 0, 0, 272), Size = UDim2.new(1, 0, 0, 128), BackgroundColor3 = C.card })
+	UI.corner(keys, 16)
+	UI.label(keys, "CONTROLS", 11, BOLD, C.muted, { Position = UDim2.new(0, 16, 0, 10), Size = UDim2.new(1, -32, 0, 14) })
+	local controls = {
+		"WASD  move      ·      Mouse  aim      ·      Hold left click  shoot",
+		"SHIFT or Q  dash      ·      E and R  abilities      ·      F  Chroma Burst",
+		"Mouse wheel  zoom      ·      M  this menu      ·      SPACE  jump over shots",
+		"On a phone: stick to move, buttons on the right. Aim is automatic.",
+	}
+	for i, text in ipairs(controls) do
+		UI.label(keys, text, 12, MEDIUM, C.text, { Position = UDim2.new(0, 16, 0, 8 + i * 24), Size = UDim2.new(1, -32, 0, 18) })
+	end
+
+	-- loadout
+	local load = Menu.pages.loadout
+	UI.label(load, "LOADOUT", 20, BLACK, C.text, { Size = UDim2.new(1, 0, 0, 26) })
+	UI.label(load, "PRIMARY", 11, BOLD, C.muted, { Position = UDim2.new(0, 0, 0, 36), Size = UDim2.new(1, 0, 0, 14) })
+	local primaries = UI.frame(load, { Position = UDim2.new(0, 0, 0, 54), Size = UDim2.new(1, 0, 0, 84) })
+	UI.new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top, Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder,
+	}, primaries)
+	for i, id in ipairs(CONFIG.primaryOrder) do
+		Menu.card(primaries, "primary", id, CONFIG.primaries[id], i)
+	end
+	UI.label(load, "ABILITIES  ·  pick two", 11, BOLD, C.muted, { Position = UDim2.new(0, 0, 0, 150), Size = UDim2.new(1, 0, 0, 14) })
+	local abilities = UI.frame(load, { Position = UDim2.new(0, 0, 0, 168), Size = UDim2.new(1, 0, 0, 254) })
+	UI.new("UIGridLayout", {
+		CellSize = UDim2.new(0, 166, 0, 78), CellPadding = UDim2.new(0, 10, 0, 10), SortOrder = Enum.SortOrder.LayoutOrder,
+		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+	}, abilities)
+	for i, id in ipairs(CONFIG.abilityOrder) do
+		Menu.card(abilities, "ability", id, CONFIG.abilities[id], i)
+	end
+
+	-- profile
+	local prof = Menu.pages.profile
+	UI.label(prof, "PROFILE", 20, BLACK, C.text, { Size = UDim2.new(1, 0, 0, 26) })
+	Menu.level = UI.label(prof, "LEVEL 1", 26, BLACK, C.gold, { Position = UDim2.new(0, 0, 0, 38), Size = UDim2.new(0.5, 0, 0, 30) })
+	Menu.rank = UI.label(prof, "Bronze", 26, BLACK, C.text, {
+		Position = UDim2.new(0.5, 0, 0, 38), Size = UDim2.new(0.5, 0, 0, 30), TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	local xpTrack = UI.frame(prof, { Position = UDim2.new(0, 0, 0, 76), Size = UDim2.new(1, 0, 0, 8), BackgroundColor3 = C.card })
+	UI.round(xpTrack)
+	Menu.xpFill = UI.frame(xpTrack, { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = C.gold })
+	UI.round(Menu.xpFill)
+	Menu.xpText = UI.label(prof, "", 11, MEDIUM, C.muted, { Position = UDim2.new(0, 0, 0, 90), Size = UDim2.new(1, 0, 0, 14) })
+	Menu.stats = {}
+	local statNames = { "Matches", "Wins", "KOs", "Dots", "Coins" }
+	local statLabels = { "MATCHES", "WINS", "KNOCK-OUTS", "DOTS PAINTED", "COINS" }
+	for i, key in ipairs(statNames) do
+		local box = UI.frame(prof, {
+			Position = UDim2.new((i - 1) / 5, i == 1 and 0 or 4, 0, 116), Size = UDim2.new(1 / 5, -4, 0, 58),
+			BackgroundColor3 = C.card,
+		})
+		UI.corner(box, 12)
+		Menu.stats[key] = UI.label(box, "0", 18, BLACK, C.text, { Position = UDim2.new(0, 0, 0, 9), Size = UDim2.new(1, 0, 0, 22), TextXAlignment = CENTER })
+		UI.label(box, statLabels[i], 8, BOLD, C.muted, { Position = UDim2.new(0, 0, 0, 36), Size = UDim2.new(1, 0, 0, 12), TextXAlignment = CENTER })
+	end
+	UI.label(prof, "TITLES  ·  shown above your name", 11, BOLD, C.muted, { Position = UDim2.new(0, 0, 0, 190), Size = UDim2.new(1, 0, 0, 14) })
+	local titles = UI.frame(prof, { Position = UDim2.new(0, 0, 0, 210), Size = UDim2.new(1, 0, 0, 210) })
+	UI.new("UIGridLayout", {
+		CellSize = UDim2.new(0, 166, 0, 44), CellPadding = UDim2.new(0, 10, 0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+	}, titles)
+	Menu.titles = {}
+	for i, id in ipairs(CONFIG.titleOrder) do
+		local def = CONFIG.titles[id]
+		local button = UI.new("TextButton", {
+			AutoButtonColor = false, Text = "", BorderSizePixel = 0, BackgroundColor3 = C.card, LayoutOrder = i,
+		}, titles)
+		UI.corner(button, 12)
+		local border = UI.stroke(button, C.gold, 2, 1)
+		UI.label(button, def.name, 13, BOLD, C.text, { Position = UDim2.new(0, 12, 0, 5), Size = UDim2.new(1, -24, 0, 18) })
+		local note = UI.label(button, "", 10, MEDIUM, C.muted, { Position = UDim2.new(0, 12, 0, 24), Size = UDim2.new(1, -24, 0, 14) })
+		Menu.titles[id] = { def = def, border = border, note = note }
+		button.Activated:Connect(function()
+			Sfx.play("click")
+			requestEvent:FireServer("title", id)
+		end)
+	end
+	Menu.show("play")
+end
+
+function Menu.show(tab)
+	Menu.tab = tab
+	for name, page in pairs(Menu.pages) do
+		page.Visible = name == tab
+		Menu.tabs[name].BackgroundColor3 = name == tab and C.cardHi or C.card
+	end
+	Menu.dirty = true
+end
+
+function Menu.refresh()
+	Menu.dirty = false
+	local lvl = player:GetAttribute("Lvl") or 1
+	local primary, a1, a2 = player:GetAttribute("Primary"), player:GetAttribute("A1"), player:GetAttribute("A2")
+	for _, card in ipairs(Menu.cards) do
+		local chosen, tag = false, ""
+		if card.slotKind == "primary" then
+			chosen = card.id == primary
+			tag = chosen and "LMB" or ""
+		elseif card.id == a1 then
+			chosen, tag = true, "E"
+		elseif card.id == a2 then
+			chosen, tag = true, "R"
+		end
+		card.border.Transparency = chosen and 0 or 1
+		card.border.Color = teamColor(myTeam() > 0 and myTeam() or 1)
+		card.tag.Text = tag
+		card.lock.Visible = lvl < card.def.unlock
+	end
+	local xp, need = player:GetAttribute("XP") or 0, math.max(1, player:GetAttribute("XPNeed") or 1)
+	local rating = player:GetAttribute("Rating") or 0
+	local rank, nextRank = rankOf(rating)
+	Menu.level.Text = "LEVEL " .. tostring(lvl)
+	Menu.rank.Text = string.upper(rank.name) .. "  " .. tostring(rating)
+	Menu.xpFill.Size = UDim2.new(math.clamp(xp / need, 0, 1), 0, 1, 0)
+	Menu.xpText.Text = tostring(xp) .. " / " .. tostring(need) .. " XP"
+		.. (nextRank and ("      ·      " .. tostring(nextRank.at - rating) .. " rating to " .. nextRank.name) or "")
+	for key, label in pairs(Menu.stats) do
+		label.Text = tostring(player:GetAttribute(key) or 0)
+	end
+	local owned = {}
+	for id in string.gmatch(player:GetAttribute("Titles") or "", "[^,]+") do
+		owned[id] = true
+	end
+	local equipped = player:GetAttribute("Title")
+	local coins = player:GetAttribute("Coins") or 0
+	for id, entry in pairs(Menu.titles) do
+		entry.border.Transparency = id == equipped and 0 or 1
+		if id == equipped then
+			entry.note.Text = "Equipped"
+			entry.note.TextColor3 = C.gold
+		elseif owned[id] then
+			entry.note.Text = "Owned  ·  tap to equip"
+			entry.note.TextColor3 = C.muted
+		else
+			entry.note.Text = tostring(entry.def.cost) .. " coins"
+			entry.note.TextColor3 = coins >= entry.def.cost and C.good or C.muted
+		end
+	end
+end
+
+function Menu.open()
+	Menu.gui.Enabled = true
+	Menu.dirty = true
+end
+
+function Menu.close()
+	Menu.gui.Enabled = false
+end
+
+function Menu.toggle()
+	if Menu.gui.Enabled then
+		Menu.close()
+	else
+		Menu.open()
+	end
+end
+
+function Menu.update()
+	if not Menu.gui.Enabled then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		local size = camera.ViewportSize
+		Menu.scale.Scale = math.clamp(math.min(size.Y / 560, size.X / 820), 0.45, 1.3)
+	end
+	local ph = phase()
+	local left = math.max(0, math.ceil((shared:GetAttribute("EndsAt") or 0) - serverNow()))
+	if ph == "Intermission" then
+		Menu.status.Text = "Next match starts in " .. tostring(left) .. "s"
+	elseif ph == "Results" then
+		Menu.status.Text = "Match over"
+	else
+		Menu.status.Text = "Match in progress. Changes apply right away."
+	end
+	if Menu.dirty then
+		Menu.refresh()
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Results card
+---------------------------------------------------------------------------------------------------
+
+function Results.build()
+	local gui = UI.new("ScreenGui", {
+		Name = "NeonCanvasResults", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 7, Enabled = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	Results.gui = gui
+	Results.scale = UI.new("UIScale", { Scale = 1 }, gui)
+	local panel = UI.panel(gui, {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -24, 0.5, 10), Size = UDim2.new(0, 400, 0, 500),
+		BackgroundTransparency = 0.08, Active = true,
+	}, 24)
+	Results.title = UI.label(panel, "", 38, BLACK, C.text, { Position = UDim2.new(0, 24, 0, 18), Size = UDim2.new(1, -48, 0, 44) })
+	Results.score = UI.label(panel, "", 14, BOLD, C.text, { Position = UDim2.new(0, 24, 0, 64), Size = UDim2.new(1, -48, 0, 18), RichText = true })
+	local head = UI.frame(panel, { Position = UDim2.new(0, 24, 0, 94), Size = UDim2.new(1, -48, 0, 16) })
+	UI.label(head, "PLAYER", 9, BOLD, C.muted, { Size = UDim2.new(0.6, 0, 1, 0) })
+	UI.label(head, "DOTS", 9, BOLD, C.muted, { Position = UDim2.new(0.6, 0, 0, 0), Size = UDim2.new(0.2, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Right })
+	UI.label(head, "KOs", 9, BOLD, C.muted, { Position = UDim2.new(0.8, 0, 0, 0), Size = UDim2.new(0.2, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Right })
+	Results.rows = UI.frame(panel, { Position = UDim2.new(0, 24, 0, 114), Size = UDim2.new(1, -48, 0, 250) })
+	Results.listProps = {
+		FillDirection = Enum.FillDirection.Vertical, HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+	}
+	UI.new("UIListLayout", Results.listProps, Results.rows)
+	local rewards = UI.frame(panel, {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 24, 1, -24), Size = UDim2.new(1, -48, 0, 96),
+		BackgroundColor3 = C.card,
+	})
+	UI.corner(rewards, 16)
+	Results.reward = UI.label(rewards, "", 14, BOLD, C.gold, { Position = UDim2.new(0, 16, 0, 12), Size = UDim2.new(1, -32, 0, 18) })
+	Results.rating = UI.label(rewards, "", 12, MEDIUM, C.text, { Position = UDim2.new(0, 16, 0, 36), Size = UDim2.new(1, -32, 0, 16) })
+	Results.unlock = UI.label(rewards, "", 12, BOLD, C.good, {
+		Position = UDim2.new(0, 16, 0, 58), Size = UDim2.new(1, -32, 0, 30), TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	})
+end
+
+function Results.show(data)
+	if type(data) ~= "table" or type(data.rows) ~= "table" then
+		return
+	end
+	local won = data.winner ~= 0 and data.winner == data.team
+	if data.winner == 0 then
+		Results.title.Text = "DRAW"
+		Results.title.TextColor3 = C.text
+	elseif won then
+		Results.title.Text = "VICTORY"
+		Results.title.TextColor3 = C.gold
+		Sfx.play("win")
+	else
+		Results.title.Text = "DEFEAT"
+		Results.title.TextColor3 = C.muted
+		Sfx.play("lose")
+	end
+	local a, b = tostring(data.a), tostring(data.b)
+	if data.mode == "Turf" then
+		local total = math.max(1, tonumber(data.total) or 1)
+		a = tostring(math.floor((tonumber(data.a) or 0) / total * 100 + 0.5)) .. "%"
+		b = tostring(math.floor((tonumber(data.b) or 0) / total * 100 + 0.5)) .. "%"
+	end
+	Results.score.Text = named(CONFIG.teamNames[1] .. "  " .. a, 1) .. "      " .. named(b .. "  " .. CONFIG.teamNames[2], 2)
+	Results.rows:ClearAllChildren()
+	UI.new("UIListLayout", Results.listProps, Results.rows)
+	for i, row in ipairs(data.rows) do
+		if i > 9 then
+			break
+		end
+		local mine = row.id == data.me
+		local line = UI.frame(Results.rows, {
+			Size = UDim2.new(1, 0, 0, 24), LayoutOrder = i, BackgroundColor3 = mine and C.cardHi or C.card,
+			BackgroundTransparency = mine and 0 or 0.5,
+		})
+		UI.corner(line, 8)
+		local name = tostring(row.n) .. (row.b and "  (bot)" or "") .. (row.mvp and "   MVP" or "")
+		UI.label(line, name, 12, mine and BOLD or MEDIUM, teamColor(row.t), {
+			Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(0.6, -10, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		UI.label(line, tostring(row.d), 12, BOLD, C.text, { Position = UDim2.new(0.6, 0, 0, 0), Size = UDim2.new(0.2, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Right })
+		UI.label(line, tostring(row.k), 12, BOLD, C.text, { Position = UDim2.new(0.8, -8, 0, 0), Size = UDim2.new(0.2, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Right })
+	end
+	local reward = data.reward
+	if type(reward) == "table" then
+		Results.reward.Text = "+" .. tostring(reward.xp) .. " XP      +" .. tostring(reward.coins) .. " coins"
+		local delta = tonumber(reward.ratingDelta) or 0
+		local rank = rankOf(tonumber(reward.rating) or 0)
+		local change = delta > 0 and ("+" .. tostring(delta)) or (delta < 0 and tostring(delta) or "no change")
+		Results.rating.Text = "Rating " .. tostring(reward.rating) .. "  (" .. change .. ")  ·  " .. rank.name
+		local notes = {}
+		if (tonumber(reward.lvl1) or 0) > (tonumber(reward.lvl0) or 0) then
+			table.insert(notes, "LEVEL UP!  You are now level " .. tostring(reward.lvl1) .. ".")
+		end
+		if type(reward.unlocks) == "table" and #reward.unlocks > 0 then
+			table.insert(notes, "Unlocked: " .. table.concat(reward.unlocks, ", "))
+		end
+		Results.unlock.Text = table.concat(notes, "  ")
+	else
+		Results.reward.Text = ""
+		Results.rating.Text = ""
+		Results.unlock.Text = ""
+	end
+	Results.gui.Enabled = true
+	Menu.dirty = true
+end
+
+function Results.hide()
+	if Results.gui then
+		Results.gui.Enabled = false
+	end
+end
+
+function Results.update()
+	local camera = workspace.CurrentCamera
+	if camera and Results.gui and Results.gui.Enabled then
+		local size = camera.ViewportSize
+		Results.scale.Scale = math.clamp(math.min(size.Y / 600, size.X / 900), 0.45, 1.3)
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Aim marker on the floor
+---------------------------------------------------------------------------------------------------
+
+local reticle = fxPart(Enum.PartType.Cylinder, C.white, 1, Vector3.new(0.15, 3, 3))
+reticle.Name = "Reticle"
+reticle.Parent = Fx.folder
+
+local function updateReticle()
+	if phase() ~= "Playing" or myTeam() == 0 or not alive() or Input.device() ~= "mouse" then
+		reticle.Transparency = 1
+		return
+	end
+	local ax, az = Input.aim()
+	local pos = me.root.Position
+	local id = player:GetAttribute("Primary") or "bolt"
+	local def = CONFIG.primaries[id] or CONFIG.primaries.bolt
+	local dx, dz = ax - pos.X, az - pos.Z
+	local d = math.sqrt(dx * dx + dz * dz)
+	if d > def.range then
+		ax, az = pos.X + dx / d * def.range, pos.Z + dz / d * def.range
+	end
+	local radius = id == "lob" and 11 or 1.6
+	reticle.Size = Vector3.new(0.15, radius * 2, radius * 2)
+	reticle.CFrame = CFrame.new(ax, FLOOR + 0.75, az) * UPRIGHT
+	reticle.Color = teamColor(myTeam())
+	reticle.Transparency = id == "lob" and 0.8 or 0.35
+end
+
+---------------------------------------------------------------------------------------------------
+-- Start
+---------------------------------------------------------------------------------------------------
+
+guard("core gui", function()
+	StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, false)
+	StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Health, false)
+	StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+	player.DevEnableMouseLock = false
+end)
+
+player.CharacterAdded:Connect(bindCharacter)
+if player.Character then
+	bindCharacter(player.Character)
+end
+
+guard("hud", Hud.build)
+guard("menu", Menu.build)
+guard("results", Results.build)
+guard("tiles", Tiles.init)
+guard("bots", BotView.init)
+guard("input", Input.init)
+
+fxEvent.OnClientEvent:Connect(function(kind, ...)
+	guard("effect", Fx.handle, kind, ...)
+end)
+feedEvent.OnClientEvent:Connect(function(kind, ...)
+	guard("feed", Hud.onFeed, kind, ...)
+end)
+resultsEvent.OnClientEvent:Connect(function(data)
+	guard("results", Results.show, data)
+end)
+player.AttributeChanged:Connect(function()
+	Menu.dirty = true
+end)
+
+RunService:BindToRenderStep("NeonCanvasCamera", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	guard("camera", Cam.update, dt)
+end)
+
+RunService.RenderStepped:Connect(function(dt)
+	guard("tiles", Tiles.update, dt)
+	guard("bots", BotView.update, dt)
+	guard("effects", Fx.update, dt)
+	guard("input", Input.update)
+	guard("reticle", updateReticle)
+	guard("hud", Hud.update, dt)
+	guard("menu", Menu.update)
+	guard("results", Results.update)
+end)
+]]></ProtectedString></Properties></Item></Item></Item></roblox>
